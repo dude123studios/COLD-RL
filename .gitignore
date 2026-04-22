@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# Large data / archives
+EDF_DATA_ARCHIVE_*.tar.gz
+EDF_DATA_BACKUP_*/
+data/benchmarks/
+*.parquet
+
+# Training outputs (checkpoints, logs, results)
+results/
+logs/
+
+# vLLM temp artifacts
+.vllm_lora_gen/
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+*.ipynb
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets
+.env
+*.key
