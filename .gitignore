@@ -3,24 +3,22 @@ __pycache__/
 *.py[cod]
 *.pyo
 .venv/
+venv/
 *.egg-info/
-
-# Large data / archives
-EDF_DATA_ARCHIVE_*.tar.gz
-EDF_DATA_BACKUP_*/
-data/benchmarks/
-*.parquet
-
-# Training outputs (checkpoints, logs, results)
-results/
-logs/
-
-# vLLM temp artifacts
-.vllm_lora_gen/
+dist/
+build/
 
 # Jupyter / IPython
 .ipynb_checkpoints/
 *.ipynb
+
+# Test / type caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+coverage.xml
+*.cover
 
 # Editor / OS
 .DS_Store
@@ -31,4 +29,65 @@ logs/
 
 # Secrets
 .env
+.env.*
 *.key
+
+# ---------------------------------------------------------------------------
+# Large / binary artifacts — never commit (re-download or regenerate)
+# ---------------------------------------------------------------------------
+
+# Model weights & training checkpoints (fetch from HuggingFace Hub or train)
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.gguf
+*.msgpack
+*.h5
+*.npy
+*.npz
+
+# HuggingFace Hub cache if stored inside the repo
+hub/
+**/hub/
+**/models--*/
+**/snapshots/
+**/blobs/
+hf_cache/
+.huggingface/
+
+# Archives (releases, backups, dataset dumps)
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.rar
+EDF_DATA_ARCHIVE_*.tar.gz
+EDF_DATA_BACKUP_*/
+
+# Experiment tracking
+wandb/
+mlruns/
+tensorboard/
+lightning_logs/
+
+# Training outputs & caches
+results/
+logs/
+.vllm_lora_gen/
+**/eval_cache/
+
+# Dataset mirrors (optional local copies — use scripts/download_benchmarks.py or HF)
+# Keep `data/benchmarks/` ignored; small bundled jsonl can stay tracked if added explicitly.
+data/benchmarks/
+*.parquet
+*.arrow
+
+# Editor / tool backups — not source of truth
+*.bak
+*.bak2
+*.tmp
+*~

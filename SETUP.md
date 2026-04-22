@@ -18,7 +18,23 @@ Each run occupies **one GPU** (`CUDA_VISIBLE_DEVICES=X`). Four jobs can run in p
 
 ---
 
-## 2. One-time setup on a fresh node
+## 2. What the Git repo does *not* include (by design)
+
+The repository is **source + scripts only**. These are **gitignored** and appear on a fresh machine after setup or first run:
+
+| Artifact | How it is obtained |
+|----------|-------------------|
+| **Base model weights** (Qwen, Llama, …) | Downloaded automatically by **Transformers** / **vLLM** from the HuggingFace Hub on first use (`~/.cache/huggingface` unless you set `HF_HOME`). |
+| **DeepScaleR / MATH / GSM8K** | Loaded via **`datasets`** from the Hub in `load_problems()` — no manual drop-in required for standard names. Optional: `python scripts/download_benchmarks.py`. |
+| **Training checkpoints & LoRA** | Written under `results/` during `rl.run_rl` — not in git. |
+| **Logs, eval caches, vLLM temp LoRA dir** | Under `logs/`, `results/**/eval_cache/`, `.vllm_lora_gen/` — ignored. |
+| **Python env** | Create with `python -m venv .venv` + `pip install -r requirements.txt`. |
+
+So **clone + pip + first training step** pulls everything heavy; you do not need to copy tarballs or weights through Git.
+
+---
+
+## 3. One-time setup on a fresh node
 
 ```bash
 # 1. Clone
@@ -44,7 +60,7 @@ pip install math-verify  # or: pip install antlr4-python3-runtime==4.11.0 latex2
 
 ---
 
-## 3. Environment variables
+## 4. Environment variables
 
 ```bash
 # Required for openrouter-based embeddings (more accurate diversity reward)
@@ -60,7 +76,7 @@ export TRANSFORMERS_CACHE=/scratch/hf_cache
 
 ---
 
-## 4. How COLD works (theory in 90 seconds)
+## 5. How COLD works (theory in 90 seconds)
 
 ### Standard GRPO recap
 At each training step:
@@ -94,9 +110,9 @@ DARLING always trains for diversity — at inference the model is always diverse
 
 ---
 
-## 5. Full experiment list (parallel-safe)
+## 6. Full experiment list (parallel-safe)
 
-### 5a. Critical new results (paper §5)
+### 6a. Critical new results (paper §5)
 
 These are the runs that **prove the paper's claims**. Run all in parallel.
 
@@ -113,7 +129,7 @@ Or use the single launcher that does all four:
 bash restart2.sh
 ```
 
-### 5b. Model scale experiments (§5.3)
+### 6b. Model scale experiments (§5.3)
 
 Run **after** 7B runs confirm methodology works; use Qwen3 models for paper tables.
 
@@ -124,7 +140,7 @@ Run **after** 7B runs confirm methodology works; use Qwen3 models for paper tabl
 | COLD-8B | Qwen/Qwen3-8B-Base | 2 | ~32 GPU-h; needs 80GB |
 | GRPO-8B | Qwen/Qwen3-8B-Base | 3 | Replication check |
 
-### 5c. Ablations (§6) — run in parallel on separate GPUs
+### 6c. Ablations (§6) — run in parallel on separate GPUs
 
 All ablations use **Qwen3-4B-Base** to keep compute manageable.
 
@@ -138,7 +154,7 @@ All ablations use **Qwen3-4B-Base** to keep compute manageable.
 | A7 — λ schedule | ① fixed ② step at epoch 3 ③ COLD linear ramp | 3 | ~42h |
 | A8 — Reward normalization | with/without std-norm | 2 | ~28h |
 
-### 5d. Science & instruction domains (§5.4–5.5)
+### 6d. Science & instruction domains (§5.4–5.5)
 
 | ID | Model | Domain | Notes |
 |----|-------|--------|-------|
@@ -149,7 +165,7 @@ All ablations use **Qwen3-4B-Base** to keep compute manageable.
 
 ---
 
-## 6. Exact launch commands per experiment
+## 7. Exact launch commands per experiment
 
 ### Primary 4-job parallel launcher (use this first)
 
@@ -212,7 +228,7 @@ On 80 GB cards you can raise batch sizes:
 
 ---
 
-## 7. Monitoring
+## 8. Monitoring
 
 ```bash
 # Are jobs alive?
@@ -235,7 +251,7 @@ tail -f logs/rl_opt_lam05.log logs/rl_opt_lam01.log logs/rl_opt_lam07.log logs/r
 
 ---
 
-## 8. Memory settings by GPU
+## 9. Memory settings by GPU
 
 | GPU VRAM | `ref_batch_size` | `mini_batch` | `max_new_tokens` | Notes |
 |----------|-----------------|-------------|-----------------|-------|
@@ -245,7 +261,7 @@ tail -f logs/rl_opt_lam05.log logs/rl_opt_lam01.log logs/rl_opt_lam07.log logs/r
 
 ---
 
-## 9. Resuming from checkpoints
+## 10. Resuming from checkpoints
 
 ```bash
 # Find latest checkpoint
@@ -261,7 +277,7 @@ python3 -u -m rl.run_rl \
 
 ---
 
-## 10. If jobs die — recovery
+## 11. If jobs die — recovery
 
 ```bash
 # Kill any orphaned vLLM workers
@@ -280,7 +296,7 @@ The init retry logic in `create_vllm_engine` (up to 6 attempts, backing off `gpu
 
 ---
 
-## 11. Output directory structure
+## 12. Output directory structure
 
 ```
 results/rl_runs/
@@ -296,7 +312,7 @@ results/rl_runs/
 
 ---
 
-## 12. Key hyperparameters reference
+## 13. Key hyperparameters reference
 
 | Param | Current value | Paper target (Qwen3 runs) | What it controls |
 |-------|--------------|--------------------------|-----------------|
@@ -314,7 +330,7 @@ results/rl_runs/
 
 ---
 
-## 13. Parallel execution plan for the paper (critical path)
+## 14. Parallel execution plan for the paper (critical path)
 
 ```
 Week 1 — 4 parallel GPUs minimum
@@ -343,7 +359,7 @@ Week 3 — domains
 
 ---
 
-## 14. What "SoTA" we are targeting
+## 15. What "SoTA" we are targeting
 
 | Domain | Published SoTA (baseline) | Our target |
 |--------|--------------------------|------------|
