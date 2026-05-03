@@ -1,372 +1,380 @@
-# COLD-RL — Fresh GPU Cluster Setup & Experiment Guide
+# COLD-RL — Setup & Experiment Guide
 
-> **What this is:** COLD (Controllable On-demand Learned Diversity) trains a Diversity-GRPO RL policy on top of Qwen models so the model can produce *K* **genuinely distinct** solution approaches on demand while staying correct.  
-> At inference, the model uses standard prompts for best-answer, or `"Approach #k"` prompts for *K* diverse solutions — diversity is **controllable, not always-on**.
+> **What this is:** COLD (Controllable On-demand Learned Diversity) trains a Diversity-GRPO RL policy so the model produces *K* **genuinely distinct** solution approaches on demand while staying correct.  
+> At inference: standard prompt → best single answer. `"Approach #k of K"` prompts → *K* diverse parallel solutions. Diversity is **controllable, not always-on**.
 
 ---
 
-## 1. Hardware requirements
+## ⚠️ Model: Always Use the Base Model
+
+**Use `Qwen/Qwen2.5-7B` — NOT `Qwen/Qwen2.5-7B-Instruct`.**
+
+This distinction is non-negotiable. Here is why:
+
+| | Base (`Qwen2.5-7B`) | Instruct (`Qwen2.5-7B-Instruct`) |
+|---|---|---|
+| Prior RLHF | None | Yes — chat/helpfulness tuning applied |
+| Policy malleability | High — RL can freely reshape the distribution | Low — prior tuning fights the new signal |
+| (i,k) conditioning headroom | Full — model learns role assignment from scratch | Reduced — instruct constraints partially override |
+| Used by DARLING, DeepSeek-R1, etc. | ✅ Base | ❌ |
+| Correct for this project | ✅ | ❌ |
+
+Using the Instruct model means 10+ hours of RLHF already spent constraining the distribution is working against you. The COLD reward needs to freely reshape how the model responds to `"Approach #i of k"` prompts — that requires a base model.
+
+**The GRPO baseline must also use the base model.** A clean comparison requires both runs — baseline (λ=0.0) and COLD (λ=0.5) — to start from the identical model checkpoint. Mixing base and instruct starting points invalidates all comparisons.
+
+---
+
+## 1. Hardware Requirements
 
 | Config | Min VRAM | Recommended |
 |--------|----------|-------------|
-| 7B training | 48 GB per GPU | 48–80 GB |
-| 4B training | 24 GB per GPU | 40–80 GB |
-| 8B training | 48 GB per GPU | 80 GB |
+| 7B training (this project) | 48 GB | 80 GB (A100-SXM4-80GB) |
 | Eval only | 24 GB | any A100/H100 |
 
-Each run occupies **one GPU** (`CUDA_VISIBLE_DEVICES=X`). Four jobs can run in parallel on four GPUs.
+Each run occupies one GPU. Parallel runs require one GPU each.
 
 ---
 
-## 2. What the Git repo does *not* include (by design)
+## 2. Fresh GPU Setup (complete, copy-paste ready)
 
-The repository is **source + scripts only**. These are **gitignored** and appear on a fresh machine after setup or first run:
-
-| Artifact | How it is obtained |
-|----------|-------------------|
-| **Base model weights** (Qwen, Llama, …) | Downloaded automatically by **Transformers** / **vLLM** from the HuggingFace Hub on first use (`~/.cache/huggingface` unless you set `HF_HOME`). |
-| **DeepScaleR / MATH / GSM8K** | Loaded via **`datasets`** from the Hub in `load_problems()` — no manual drop-in required for standard names. Optional: `python scripts/download_benchmarks.py`. |
-| **Training checkpoints & LoRA** | Written under `results/` during `rl.run_rl` — not in git. |
-| **Logs, eval caches, vLLM temp LoRA dir** | Under `logs/`, `results/**/eval_cache/`, `.vllm_lora_gen/` — ignored. |
-| **Python env** | Create with `python -m venv .venv` + `pip install -r requirements.txt`. |
-
-So **clone + pip + first training step** pulls everything heavy; you do not need to copy tarballs or weights through Git.
-
----
-
-## 3. One-time setup on a fresh node
+### Step 1 — Verify hardware
 
 ```bash
-# 1. Clone
+nvidia-smi
+# Confirm: ≥48GB VRAM, driver ≥525
+python3 --version
+# Confirm: Python 3.10, 3.11, or 3.12
+```
+
+### Step 2 — Clone repo
+
+```bash
+# If repo is private, use your PAT:
 git clone https://github.com/dude123studios/COLD-RL.git
 cd COLD-RL
+```
 
-# 2. Python environment (Python 3.10–3.13 OK)
+### Step 3 — Python environment
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
-
-# 3. Install dependencies
 pip install --upgrade pip
-pip install -r requirements.txt
-
-# 4. (Optional) math verifier — needed for DeepScaleR / MATH grading
-pip install math-verify  # or: pip install antlr4-python3-runtime==4.11.0 latex2sympy2
 ```
 
-> **Note:** `vllm` ≥ 0.6 is required. If you hit `EngineCoreClient` init errors, pin to a known-good vLLM version:
-> ```bash
-> pip install "vllm==0.8.5"
-> ```
-
----
-
-## 4. Environment variables
+### Step 4 — Install dependencies
 
 ```bash
-# Required for openrouter-based embeddings (more accurate diversity reward)
-export OPENROUTER_API_KEY="sk-or-..."
+pip install -r requirements.txt
+```
 
-# Reduces CUDA allocator fragmentation — ALWAYS set this
+Confirmed working versions (as of 2026-05-03):
+```
+torch==2.11.0+cu130
+vllm==0.20.0
+transformers==5.7.0
+peft==0.19.1
+```
+
+If vLLM install fails or produces `EngineCoreClient` errors, pin:
+```bash
+pip install "vllm==0.8.5"
+```
+
+### Step 5 — Pre-download model weights
+
+Do this **before** training starts to avoid download overhead at the first step. Uses ~15 GB disk.
+
+```bash
+python3 -c "
+from transformers import AutoModelForCausalLM, AutoTokenizer
+print('Downloading Qwen/Qwen2.5-7B base model...')
+tok = AutoTokenizer.from_pretrained('Qwen/Qwen2.5-7B')
+m = AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-7B')
+print('Done. Weights cached at:', tok.vocab_size)
+del m
+"
+```
+
+Alternatively, use the HuggingFace CLI:
+```bash
+pip install huggingface_hub
+huggingface-cli download Qwen/Qwen2.5-7B
+```
+
+### Step 6 — Pre-download DeepScaleR dataset
+
+```bash
+python3 -c "
+from datasets import load_dataset
+ds = load_dataset('agentica-org/DeepScaleR-Preview-Dataset')
+print('DeepScaleR loaded:', len(ds['train']), 'problems')
+"
+```
+
+### Step 7 — Set environment variables
+
+```bash
+# Always set — prevents CUDA allocator fragmentation on long runs
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
-# Optional: set HF cache dir if disk space is limited elsewhere
-export HF_HOME=/scratch/hf_cache
-export TRANSFORMERS_CACHE=/scratch/hf_cache
+# Optional: redirect HF cache if default disk is small
+export HF_HOME=/workspace/hf_cache
+export TRANSFORMERS_CACHE=/workspace/hf_cache
+
+# Not required if using --embed_model local (e5-small-v2, which is the default)
+# Only set if switching to OpenRouter embeddings:
+# export OPENROUTER_API_KEY="sk-or-..."
+```
+
+Add these to `~/.bashrc` or prepend to every launch command.
+
+### Step 8 — Create output directories
+
+```bash
+mkdir -p logs results/rl_runs
+```
+
+### Step 9 — Sanity check (optional but recommended)
+
+Runs 1 training step with 4 problems to confirm vLLM init, LoRA, and reward pipeline work:
+
+```bash
+PYTORCH_ALLOC_CONF=expandable_segments:True python3 -m rl.run_rl \
+  --model Qwen/Qwen2.5-7B \
+  --dataset deepscaler \
+  --benchmark math \
+  --n_rollouts 4 \
+  --total_steps 1 \
+  --n_problems_per_step 4 \
+  --mini_batch 4 \
+  --ref_batch_size 2 \
+  --max_new_tokens 512 \
+  --lambda_div 0.5 \
+  --embed_model local \
+  --output_dir results/rl_runs/sanity_check \
+  --gpu_id 0
+# Should complete in ~3 minutes. If it finishes without OOM, setup is good.
 ```
 
 ---
 
-## 5. How COLD works (theory in 90 seconds)
+## 3. How COLD Works (90-second theory)
 
-### Standard GRPO recap
-At each training step:
-1. Sample *B* problems × *K* rollouts → 256 completions
-2. Compute correctness reward (binary pass/fail via math-verify)
-3. Normalize rewards within each group of *K* rollouts (GRPO advantage)
-4. Policy gradient update
+### The (i, k) conditioning design
 
-### What COLD adds
-1. **Method prefix in the prompt:** each rollout uses prompt `"Solve using mathematical approach #k of K (algebraic, geometric, number-theoretic…)"`. This makes the model learn to produce method-specific solutions.
-2. **Diversity reward:** for each correct rollout *i*, compute the max cosine distance between any step in trace *i* and any step in any other trace in the same group.  
-   ```
-   diversity_score_i = max_{j≠i} max_{s in trace_i, s' in trace_j} cosine_dist(embed(s), embed(s'))
-   ```
-3. **Gated combined reward:**  
-   ```
-   r_i = r_correct_i + λ × r_correct_i × diversity_score_i
-   ```
-   Diversity reward is **zero** if the answer is wrong — the model can't earn diversity bonus by being creatively wrong.
+Every problem gets *k* parallel rollouts. Each rollout receives a distinct prefix **before generation starts**. All *k* run simultaneously with zero inter-sample communication.
+
+```
+Sample 1 of k: π_θ(y | x, i=1, k=8)  ← role: first solver
+Sample 2 of k: π_θ(y | x, i=2, k=8)  ← role: second solver, must differ
+...
+Sample k of k: π_θ(y | x, i=k, k=8)  ← role: k-th solver, covers remainder
+```
+
+The prefix is explicit text — not a soft token:
+```
+System: "You are a brilliant mathematician...asked to solve using a specific solution approach."
+User:   "Solve using mathematical approach #i of k (each approach should be conceptually
+         distinct — e.g., algebraic, geometric, number-theoretic, direct computation...)
+         ...Approach #i: Solve step by step and conclude with \boxed{answer}."
+```
+
+This is the correct design because: all *k* samples run in parallel (no sequential dependency, no latency scaling with k), and each sample knows its role index *i* in the collective, not just the group size *k*. Conditioning on *k* alone pushes all samples toward higher entropy uniformly — that's just temperature scaling. Conditioning on *(i, k)* assigns each sample a distinct region of solution space.
+
+### Reward
+
+```
+r_i = r_correct_i  +  λ × r_correct_i × diversity_score_i
+```
+
+- `r_correct_i`: binary (1 if math-verify passes, 0 if not)
+- `diversity_score_i`: max cosine distance between any step in trace *i* vs any step in any other trace in the same group (via e5-small-v2 embeddings of reasoning steps)
+- **Gated**: diversity bonus is zero if the answer is wrong — can't earn diversity by being creatively incorrect
 
 ### What λ controls
+
 | λ | Effect |
 |---|--------|
-| 0.0 | Pure GRPO — no diversity signal (baseline) |
-| 0.1 | Mild diversity nudge |
-| 0.5 | Primary setting — balanced correctness + diversity |
-| 0.7 | Strong diversity pressure |
+| 0.0 | Pure GRPO — no diversity signal **(clean baseline)** |
+| 0.1 | Mild diversity nudge (ablation) |
+| 0.5 | **Primary setting** — balanced correctness + diversity |
+| 0.7 | Strong diversity pressure (ablation) |
 
-### Why this beats DARLING
-DARLING always trains for diversity — at inference the model is always diverse, which can hurt accuracy on standard prompts. COLD trains **on-demand diversity**: standard prompt → best answer; method prompt → diverse solutions. This gives the best of both worlds.
+### Why COLD beats DARLING
 
----
-
-## 6. Full experiment list (parallel-safe)
-
-### 6a. Critical new results (paper §5)
-
-These are the runs that **prove the paper's claims**. Run all in parallel.
-
-| ID | GPU | Command |
-|----|-----|---------|
-| **GRPO-baseline** | 0 | `bash scripts/run_grpo_baseline.sh` |
-| **COLD λ=0.5** | 1 | `bash scripts/run_cold_lam05.sh` |
-| **COLD λ=0.1** | 2 | `bash scripts/run_cold_lam01.sh` |
-| **COLD λ=0.7** | 3 | `bash scripts/run_cold_lam07.sh` |
-
-Or use the single launcher that does all four:
-
-```bash
-bash restart2.sh
-```
-
-### 6b. Model scale experiments (§5.3)
-
-Run **after** 7B runs confirm methodology works; use Qwen3 models for paper tables.
-
-| ID | Model | GPU | Notes |
-|----|-------|-----|-------|
-| COLD-4B | Qwen/Qwen3-4B-Base | 0 | ~18 GPU-h |
-| GRPO-4B | Qwen/Qwen3-4B-Base | 1 | Replication of DARLING — cite directly if ±0.5pp |
-| COLD-8B | Qwen/Qwen3-8B-Base | 2 | ~32 GPU-h; needs 80GB |
-| GRPO-8B | Qwen/Qwen3-8B-Base | 3 | Replication check |
-
-### 6c. Ablations (§6) — run in parallel on separate GPUs
-
-All ablations use **Qwen3-4B-Base** to keep compute manageable.
-
-| Ablation | Sweep values | GPUs needed | GPU-h est. |
-|----------|-------------|-------------|------------|
-| **A2 — Diversity metric** (most critical) | ① none ② 4-gram ③ semantic cls (DARLING) ④ embed full solution ⑤ embed trace only (COLD) | 5 | ~70h |
-| A1 — Conditioning mechanism | ① no prefix ② random id ③ `#k` only ④ strategy prefix ⑤ COLD full | 5 | ~70h |
-| A3 — Reward fusion | ① additive ② multiplicative ③ COLD gated | 3 | ~42h |
-| A4 — K rollouts | K ∈ {2, 4, 6, 8, 12} | 5 | ~60h |
-| A5 — λ sweep | λ ∈ {0.1, 0.2, 0.3, 0.5, 0.7, 1.0} | 6 | ~84h |
-| A7 — λ schedule | ① fixed ② step at epoch 3 ③ COLD linear ramp | 3 | ~42h |
-| A8 — Reward normalization | with/without std-norm | 2 | ~28h |
-
-### 6d. Science & instruction domains (§5.4–5.5)
-
-| ID | Model | Domain | Notes |
-|----|-------|--------|-------|
-| COLD-SCI | Qwen3-8B-Base | SciKnowEval Chem+Physics | 5h wall-clock target |
-| GRPO-SCI | Qwen3-8B-Base | Same | Comparison baseline |
-| COLD-LLM | Llama-3.1-8B-Instruct | AlpacaEval / ArenaHard | WildChat 10k data |
-| GRPO-LLM | Llama-3.1-8B-Instruct | Same | Comparison baseline |
+DARLING trains unconditional diversity — the model is always diverse, which can hurt accuracy on standard prompts. COLD trains *on-demand* diversity: same checkpoint, different inference-time behavior depending on whether you use method prompts.
 
 ---
 
-## 7. Exact launch commands per experiment
+## 4. Experiment Runs
 
-### Primary 4-job parallel launcher (use this first)
+### Priority order (with 1–2 GPUs available)
 
+| Priority | Run | λ | GPU | Why |
+|----------|-----|---|-----|-----|
+| 1 | COLD λ=0.5 | 0.5 | new GPU | Primary paper result |
+| 2 | GRPO baseline | 0.0 | current GPU | Must finish for comparison |
+| 3 | COLD λ=0.7 | 0.7 | 3rd GPU if available | Ablation |
+| 4 | COLD λ=0.1 | 0.1 | 4th GPU if available | Ablation |
+
+### Exact launch command (all runs use identical flags, only `--lambda_div` and `--output_dir` differ)
+
+**GRPO baseline (λ=0.0):**
 ```bash
-cd COLD-RL
-bash restart2.sh
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+nohup python3 -u -m rl.run_rl \
+  --model Qwen/Qwen2.5-7B \
+  --dataset deepscaler \
+  --benchmark math \
+  --n_rollouts 8 \
+  --temperature 0.8 \
+  --total_steps 700 \
+  --n_problems_per_step 32 \
+  --mini_batch 16 \
+  --ref_batch_size 4 \
+  --max_new_tokens 4096 \
+  --lr 1e-6 \
+  --kl_beta 0.001 \
+  --embed_model local \
+  --lora_r 64 \
+  --lora_alpha 128 \
+  --log_every 10 \
+  --save_every 200 \
+  --lambda_div 0.0 \
+  --output_dir results/rl_runs/grpo_baseline_7b \
+  --gpu_id 0 \
+> logs/train_grpo_baseline_7b.log 2>&1 &
 ```
 
-This runs:
-- GPU 0: COLD λ=0.5 (primary claim)
-- GPU 1: COLD λ=0.1
-- GPU 2: COLD λ=0.7
-- GPU 3: GRPO λ=0.0 (baseline)
-
-All with: `Qwen2.5-7B-Instruct`, DeepScaleR 10k, 1000 steps, LoRA rank 64, `save_every=100`.
-
-### Manual single-job launch
-
+**COLD λ=0.5 (primary result) — run on new GPU:**
 ```bash
-# COLD λ=0.5 (primary)
-CUDA_VISIBLE_DEVICES=0 PYTORCH_ALLOC_CONF=expandable_segments:True \
-  python3 -u -m rl.run_rl \
-    --model Qwen/Qwen2.5-7B-Instruct \
-    --dataset deepscaler \
-    --benchmark math \
-    --n_rollouts 8 \
-    --total_steps 1000 \
-    --n_problems_per_step 32 \
-    --mini_batch 8 \
-    --ref_batch_size 4 \
-    --max_new_tokens 4096 \
-    --lr 1e-6 \
-    --kl_beta 0.001 \
-    --embed_model local \
-    --lora_r 64 \
-    --log_every 10 \
-    --save_every 100 \
-    --lambda_div 0.5 \
-    --output_dir results/rl_runs/cold_deepscaler_lambda05_7b \
-    > logs/rl_opt_lam05.log 2>&1 &
-
-# GRPO baseline (λ=0)
-CUDA_VISIBLE_DEVICES=1 PYTORCH_ALLOC_CONF=expandable_segments:True \
-  python3 -u -m rl.run_rl \
-    --model Qwen/Qwen2.5-7B-Instruct \
-    --dataset deepscaler \
-    --benchmark math \
-    --lambda_div 0.0 \
-    --output_dir results/rl_runs/grpo_baseline_deepscaler_7b \
-    > logs/rl_opt_grpo.log 2>&1 &
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+nohup python3 -u -m rl.run_rl \
+  --model Qwen/Qwen2.5-7B \
+  --dataset deepscaler \
+  --benchmark math \
+  --n_rollouts 8 \
+  --temperature 0.8 \
+  --total_steps 700 \
+  --n_problems_per_step 32 \
+  --mini_batch 16 \
+  --ref_batch_size 4 \
+  --max_new_tokens 4096 \
+  --lr 1e-6 \
+  --kl_beta 0.001 \
+  --embed_model local \
+  --lora_r 64 \
+  --lora_alpha 128 \
+  --log_every 10 \
+  --save_every 200 \
+  --lambda_div 0.5 \
+  --output_dir results/rl_runs/cold_deepscaler_lambda05_7b \
+  --gpu_id 0 \
+> logs/cold_lambda05_7b.log 2>&1 &
 ```
 
-### 80 GB GPU — faster settings
+**COLD λ=0.7 (ablation):**  
+Same as above, `--lambda_div 0.7 --output_dir results/rl_runs/cold_deepscaler_lambda070_7b > logs/cold_lambda07_7b.log`
 
-On 80 GB cards you can raise batch sizes:
+**COLD λ=0.1 (ablation):**  
+Same as above, `--lambda_div 0.1 --output_dir results/rl_runs/cold_deepscaler_lambda010_7b > logs/cold_lambda01_7b.log`
 
-```bash
---ref_batch_size 8 --mini_batch 16
-```
+> **Clean comparison rule:** All runs must use the identical set of flags above — same model, same hyperparameters, same total_steps. The only thing that varies is `--lambda_div` and `--output_dir`. A baseline trained with different hyperparameters cannot be compared to a COLD run.
 
 ---
 
-## 8. Monitoring
+## 5. Monitoring
 
 ```bash
-# Are jobs alive?
+# Check jobs are alive
 pgrep -af rl.run_rl
 
 # GPU memory
 nvidia-smi
 
-# Live training metrics (step, loss, pass@1, diversity)
-tail -f logs/rl_opt_lam05.log
+# Live log
+tail -f logs/cold_lambda05_7b.log
 
-# Structured metrics log (JSON per step)
+# Step-level metrics (loss, pass@1, diversity) as JSON
 tail -n 5 results/rl_runs/cold_deepscaler_lambda05_7b/training_log.jsonl
 
-# Watch all four logs side by side
-tail -f logs/rl_opt_lam05.log logs/rl_opt_lam01.log logs/rl_opt_lam07.log logs/rl_opt_grpo.log
+# Watch multiple logs side by side
+tail -f logs/train_grpo_baseline_7b.log logs/cold_lambda05_7b.log
 ```
 
-**Evals** run automatically at `save_every=100` steps, reporting `pass@1`, `pass@4`, `pass@8`, `pass@16` via the COLD methodology (8 method approaches × 2 cycles = 16 samples per problem, 50 eval problems).
+Expected speed: **~11–13 minutes per step** on A100-80GB. First checkpoint at step 200 (~40h from cold start, ~25h from step 50).
 
 ---
 
-## 9. Memory settings by GPU
-
-| GPU VRAM | `ref_batch_size` | `mini_batch` | `max_new_tokens` | Notes |
-|----------|-----------------|-------------|-----------------|-------|
-| 48 GB | 2–4 | 8 | 2048–4096 | vLLM re-init each step |
-| 80 GB | 8 | 16 | 4096–8192 | Can keep vLLM persistent |
-| 2× GPU | 8 | 16 | 8192 | Use two separate jobs, one per GPU |
-
----
-
-## 10. Resuming from checkpoints
+## 6. Resuming from a Checkpoint
 
 ```bash
 # Find latest checkpoint
-ls results/rl_runs/cold_deepscaler_lambda05_7b/step_*/
+ls results/rl_runs/cold_deepscaler_lambda05_7b/
 
-# Resume
-python3 -u -m rl.run_rl \
-    ... \
-    --resume_from results/rl_runs/cold_deepscaler_lambda05_7b/step_00200
+# Resume (add --resume_from to any launch command above)
+... --resume_from results/rl_runs/cold_deepscaler_lambda05_7b/step_00200 ...
 ```
-
-`restart2.sh` resumes from `step_00100` by default. Update the `--resume_from` paths in that script to the latest checkpoint as training progresses.
 
 ---
 
-## 11. If jobs die — recovery
+## 7. Recovery After Job Death
 
 ```bash
-# Kill any orphaned vLLM workers
 pkill -9 -f run_rl
 pkill -9 -f EngineCore
 sleep 10
-
-# Check GPU is clear
-nvidia-smi
-
-# Relaunch
-bash restart2.sh
+nvidia-smi   # confirm GPU memory is free
+# Re-run the launch command above with --resume_from latest checkpoint
 ```
 
-The init retry logic in `create_vllm_engine` (up to 6 attempts, backing off `gpu_memory_utilization` by ×0.88 each time) handles most vLLM OOM failures automatically without needing a manual restart.
+vLLM init retries automatically (up to 6 attempts, backing off `gpu_memory_utilization` ×0.88 each attempt) — most OOM failures self-heal without manual restart.
 
 ---
 
-## 12. Output directory structure
+## 8. Output Structure
 
 ```
 results/rl_runs/
   cold_deepscaler_lambda05_7b/
-    step_00100/           # LoRA adapter checkpoint
+    step_00200/
       adapter_config.json
       adapter_model.safetensors
-      metrics.json        # training + eval metrics at this step
-    step_00200/
-    training_log.jsonl    # one JSON line per log_every steps
-    .vllm_lora_gen/       # temp LoRA weights for vLLM (overwritten each step)
+      metrics.json           # training + eval metrics at this checkpoint
+    training_log.jsonl       # one JSON line per log_every steps
+    .vllm_lora_gen/          # temp LoRA for vLLM, overwritten each step
 ```
 
 ---
 
-## 13. Key hyperparameters reference
+## 9. Evaluation Protocol (pass@k)
 
-| Param | Current value | Paper target (Qwen3 runs) | What it controls |
-|-------|--------------|--------------------------|-----------------|
-| `model` | Qwen2.5-7B-Instruct | Qwen3-4B-Base / 8B-Base | Base model |
-| `lambda_div` | 0.5 | 0.5 (ramp 0→0.5 over epochs 1–3) | Diversity reward weight |
-| `n_rollouts` | 8 | 8 | Method prompts per problem |
-| `temperature` | 0.8 | **Train 1.0 / Eval 0.6** | Rollout diversity |
-| `max_new_tokens` | 4096 | 8192 (DARLING) | Max response length |
-| `lr` | 1e-6 | 1e-6 | Learning rate |
-| `kl_beta` | 0.001 | 0.0 for math, 0.001 for instruct | KL penalty weight |
-| `lora_r` | 64 | 64 | LoRA rank |
-| `n_problems_per_step` | 32 | 32 | Batch size in problems |
-| `total_steps` | 1000 | ~1000 (10 epochs) | Training length |
-| `embed_model` | local | local (e5-small-v2) | Diversity embedding |
+Evals run automatically at each checkpoint. Metrics reported:
+- `pass@1`, `pass@4`, `pass@8`, `pass@16`
+- Method: 8 approach prompts × 2 cycles = 16 samples per problem, 50 eval problems
+- **Do not evaluate pass@1 alone** — the whole point of COLD is pass@k for k > 1
 
 ---
 
-## 14. Parallel execution plan for the paper (critical path)
+## 10. Hyperparameter Reference
 
-```
-Week 1 — 4 parallel GPUs minimum
-  GPU 0: COLD λ=0.5  (primary result)
-  GPU 1: COLD λ=0.1  (ablation A5)
-  GPU 2: COLD λ=0.7  (ablation A5)
-  GPU 3: GRPO λ=0.0  (baseline)
-
-Week 1–2 — when more GPUs available
-  GPU 4: COLD-4B (Qwen3-4B-Base)   ← paper model
-  GPU 5: GRPO-4B (Qwen3-4B-Base)   ← replication check for DARLING
-  GPU 6: COLD-8B (Qwen3-8B-Base)   ← scale
-  GPU 7: GRPO-8B (Qwen3-8B-Base)   ← replication check
-
-Week 2–3 — ablations (need 5–6 GPUs each)
-  Ablation A2 (diversity metric):  5 GPU-parallel runs × ~14h = ~14h wall-clock
-  Ablation A1 (conditioning):      5 runs × ~14h
-  Ablation A5 (λ sweep):           6 runs × ~14h
-
-Week 3 — domains
-  COLD-SCI (Qwen3-8B, SciKnowEval): 5h wall-clock
-  COLD-LLM (Llama-3.1-8B, WildChat): ~10h
-```
-
-**Minimum compute for a submittable paper:** ~115 GPU-hours of new training runs (critical §5 results only). With 4 GPUs running in parallel, that's **~29 hours wall-clock** before you have complete critical results.
-
----
-
-## 15. What "SoTA" we are targeting
-
-| Domain | Published SoTA (baseline) | Our target |
-|--------|--------------------------|------------|
-| Math (AIME25) | DARLING / DeepSeek-R1 | COLD-4B/8B pass@16 >> GRPO pass@16 |
-| Math (OlympiadBench) | DARLING | COLD pass@1 ≥ GRPO; COLD pass@16 >> GRPO |
-| Science (SciKnowEval) | SDPO avg@16 | COLD-SCI >> GRPO-SCI at 5h wall-clock |
-| Instruction following | DARLING (AlpacaEval) | COLD-LLM win-rate > GRPO-LLM, ≥ DARLING |
-
-The central claim is **not raw pass@1 beats everything**, it is that:  
-> COLD significantly improves **pass@k for k > 1** (coverage / diversity) while maintaining or improving **pass@1** — something GRPO cannot do by design.
+| Param | Value | Notes |
+|-------|-------|-------|
+| `model` | `Qwen/Qwen2.5-7B` | **Base model — no -Instruct suffix** |
+| `lambda_div` | 0.0 / 0.5 / 0.7 / 0.1 | Varies per run — see §4 |
+| `n_rollouts` | 8 | One method prompt per rollout |
+| `temperature` | 0.8 | Training rollout temperature |
+| `total_steps` | 700 | ~140h per run on A100-80GB |
+| `n_problems_per_step` | 32 | Batch size in problems |
+| `mini_batch` | 16 | Gradient mini-batch |
+| `ref_batch_size` | 4 | Ref log-prob batch (reduce to 2 if OOM) |
+| `max_new_tokens` | 4096 | Max response length |
+| `lr` | 1e-6 | Learning rate |
+| `kl_beta` | 0.001 | KL penalty |
+| `lora_r` | 64 | LoRA rank |
+| `lora_alpha` | 128 | LoRA alpha |
+| `embed_model` | `local` | e5-small-v2, frozen, diversity scoring |
+| `save_every` | 200 | Checkpoint interval |
+| `log_every` | 10 | Metrics log interval |
