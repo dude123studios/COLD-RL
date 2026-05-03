@@ -17,49 +17,51 @@ from generation.rollout import extract_answer
 
 EVAL_CACHE_DIR = Path(__file__).parent.parent / "results" / "eval_cache"
 
-SYSTEM_PROMPT_MATH = "Please reason step by step, and put your final answer within \\boxed{}."
-SYSTEM_PROMPT_GPQA = "Please reason step by step, then state your final answer as a single letter (A, B, C, or D) on the last line."
-SYSTEM_PROMPT_CODE = "You are an expert competitive programmer. Write clean, efficient Python code."
+# Instruction suffixes appended into the user message (no system role).
+# Matches DARLING / DeepScaleR training format: instruction lives in user turn.
+_INSTRUCTION = {
+    "default":        "Please reason step by step, and put your final answer within \\boxed{}.",
+    "gpqa_diamond":   "Please reason step by step, then state your final answer as a single letter (A, B, C, or D) on the last line.",
+    "mmlu":           "Please reason step by step, then state your final answer as a single letter (A, B, C, or D) on the last line.",
+    "arc":            "Please reason step by step, then state your final answer as a single letter (A, B, C, or D) on the last line.",
+    "livecodebench":  "Please reason step by step, then write your final answer as clean Python code.",
+}
 
-# Backwards-compatible alias
+# Backwards-compatible alias used by other modules
+SYSTEM_PROMPT_MATH = _INSTRUCTION["default"]
+SYSTEM_PROMPT_GPQA = _INSTRUCTION["gpqa_diamond"]
+SYSTEM_PROMPT_CODE = _INSTRUCTION["livecodebench"]
 SYSTEM_PROMPT = SYSTEM_PROMPT_MATH
 
 MC_BENCHMARKS = {"gpqa_diamond", "mmlu", "arc"}
 
 
-def _format_chat(content: str, system: str, model: str = "") -> str:
+def _format_chat(content: str, model: str = "") -> str:
+    """No-system-message chat format. Instruction is already embedded in content."""
     m = model.lower()
     if "llama-3" in m or "llama3" in m:
         return (
-            f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-            f"{system}<|eot_id|>"
-            f"<|start_header_id|>user<|end_header_id|>\n\n"
+            f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
             f"{content}<|eot_id|>"
             f"<|start_header_id|>assistant<|end_header_id|>\n\n"
         )
     elif "mistral" in m or "mixtral" in m:
-        return f"[INST] {system}\n\n{content} [/INST]"
+        return f"[INST] {content} [/INST]"
     elif "gemma" in m:
         return (
-            f"<start_of_turn>user\n{system}\n\n{content}<end_of_turn>\n"
+            f"<start_of_turn>user\n{content}<end_of_turn>\n"
             f"<start_of_turn>model\n"
         )
-    else:  # Qwen2/2.5, default
+    else:  # Qwen2/2.5/3, default
         return (
-            f"<|im_start|>system\n{system}<|im_end|>\n"
             f"<|im_start|>user\n{content}<|im_end|>\n"
             f"<|im_start|>assistant\n"
         )
 
 
 def _prompt(problem: str, benchmark: str = "math500", model: str = "") -> str:
-    if benchmark in MC_BENCHMARKS:
-        sys = SYSTEM_PROMPT_GPQA
-    elif benchmark == "livecodebench":
-        sys = SYSTEM_PROMPT_CODE
-    else:
-        sys = SYSTEM_PROMPT_MATH
-    return _format_chat(problem, sys, model)
+    instruction = _INSTRUCTION.get(benchmark, _INSTRUCTION["default"])
+    return _format_chat(f"{problem}\n\n{instruction}", model)
 
 
 def _cache_key(base_model: str, lora_path: Optional[str], benchmark: str, n: int, temperature: float) -> str:

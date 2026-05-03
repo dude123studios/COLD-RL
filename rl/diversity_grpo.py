@@ -44,14 +44,12 @@ logger = logging.getLogger(__name__)
 # Prompt formatting
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = "You are a helpful assistant. Think step by step."
-
-# "[PARALLEL SAMPLE {i} OF {k}]" prepended as plain text before the problem.
-# k=1,i=1 -> quality-only mode (no diversity role).
-# k=8,i=3 -> third of 8 independent parallel solvers.
-# The model learns what role i-of-k means purely from the reward signal.
-# Do NOT add explicit mode labels or strategy hints — roles are implicit.
+# No system prompt — matches DARLING / DeepScaleR training format exactly.
+# Adding a system message would diverge from the baseline we compare against.
 PARALLEL_PREFIX = "[PARALLEL SAMPLE {i} OF {k}]"
+
+# Standard math instruction suffix — same wording used across DeepScaleR ecosystem.
+MATH_INSTRUCTION = "Please reason step by step, and put your final answer within \\boxed{}."
 
 
 def lambda_fn(k: int, alpha: float = 0.3, k_max: int = 16) -> float:
@@ -73,14 +71,20 @@ K_TRAINING_VALUES = [1, 2, 4, 8, 16]
 
 
 def format_problem_prompt(problem: str, i: int, k: int) -> str:
+    """
+    k=1: no prefix — standard quality-only prompt identical to DARLING baseline.
+    k>1: [PARALLEL SAMPLE i OF k] prefix — controllable diversity mode.
+    No prefix at k=1 means "standard mode" at inference too (no prefix = best answer).
+    """
+    if k <= 1:
+        return f"{problem}\n\n{MATH_INSTRUCTION}"
     prefix = PARALLEL_PREFIX.format(i=i, k=k)
-    return f"{prefix}\n\n{problem}\n\nSolve this step by step and conclude with \\boxed{{your final answer}}."
+    return f"{prefix}\n\n{problem}\n\n{MATH_INSTRUCTION}"
 
 
 def build_chat_prompt(tokenizer, problem: str, method_id: int, n_methods: int = 8) -> str:
     """Build chat-formatted prompt. method_id=i, n_methods=k."""
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": format_problem_prompt(problem, method_id, n_methods)},
     ]
     return tokenizer.apply_chat_template(

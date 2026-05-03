@@ -26,30 +26,24 @@ from vllm import LLM, SamplingParams
 
 
 PARALLEL_PREFIX = "[PARALLEL SAMPLE {i} OF {k}]"
-SYSTEM_PROMPT = "You are a helpful assistant. Think step by step."
+MATH_INSTRUCTION = "Please reason step by step, and put your final answer within \\boxed{}."
 
 
 def build_prompts_arm_a(tokenizer, problem: str, k: int) -> list[str]:
-    """k prompts with distinct role prefixes "[PARALLEL SAMPLE i OF k]"."""
+    """k prompts with COLD-RL prefix — matches training format exactly (no system message)."""
     prompts = []
     for i in range(1, k + 1):
         prefix = PARALLEL_PREFIX.format(i=i, k=k)
-        user_msg = f"{prefix}\n\n{problem}\n\nSolve step by step and conclude with \\boxed{{answer}}."
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ]
+        user_msg = f"{prefix}\n\n{problem}\n\n{MATH_INSTRUCTION}"
+        messages = [{"role": "user", "content": user_msg}]
         prompts.append(tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
     return prompts
 
 
 def build_prompts_arm_bc(tokenizer, problem: str, k: int) -> list[str]:
-    """k identical prompts, no role prefix."""
-    user_msg = f"{problem}\n\nSolve step by step and conclude with \\boxed{{answer}}."
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_msg},
-    ]
+    """k identical prompts, no prefix — matches DARLING / baseline format exactly."""
+    user_msg = f"{problem}\n\n{MATH_INSTRUCTION}"
+    messages = [{"role": "user", "content": user_msg}]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     return [prompt] * k
 

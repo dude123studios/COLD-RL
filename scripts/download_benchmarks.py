@@ -63,7 +63,7 @@ def download_gpqa_diamond():
         problem = (
             f"{item['Question']}\n\n"
             f"{choices_formatted}\n\n"
-            f"Think step by step, then write your final answer as a single letter "
+            f"Please reason step by step, then state your final answer as a single letter "
             f"(A, B, C, or D) on the last line."
         )
 

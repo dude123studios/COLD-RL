@@ -514,7 +514,7 @@ def _augment_dataset_local(
 
         # Wrap in model-appropriate chat format
         from evaluation.vllm_generate import _format_chat
-        prompts.append(_format_chat(user_msg, "You are a helpful math assistant.", model_name))
+        prompts.append(_format_chat(user_msg, model_name))
 
     llm = LLM(
         model=model_name,

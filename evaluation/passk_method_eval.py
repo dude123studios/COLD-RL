@@ -30,15 +30,15 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Must match rl/diversity_grpo.py exactly — the model is conditioned on these strings
-SYSTEM_PROMPT = "You are a helpful assistant. Think step by step."
+# Must match rl/diversity_grpo.py exactly — the model is conditioned on these strings.
+# No system prompt: matches DARLING / DeepScaleR training format.
 PARALLEL_PREFIX = "[PARALLEL SAMPLE {i} OF {k}]"
 
-# Benchmark-specific answer instructions (appended after the problem statement)
+# Benchmark-specific answer instructions — same suffix used during training
 _ANSWER_INSTRUCTION = {
-    "default":        "Solve this step by step and conclude with \\boxed{{your final answer}}.",
-    "gpqa_diamond":   "Reason step by step, then state your final answer as a single letter (A, B, C, or D) on the last line.",
-    "livecodebench":  "Write clean, correct Python code as your final answer.",
+    "default":        "Please reason step by step, and put your final answer within \\boxed{}.",
+    "gpqa_diamond":   "Please reason step by step, then state your final answer as a single letter (A, B, C, or D) on the last line.",
+    "livecodebench":  "Please reason step by step, then write your final answer as clean Python code.",
 }
 
 
@@ -47,14 +47,17 @@ def _answer_instruction(benchmark: str) -> str:
 
 
 def _method_user_content(problem: str, i: int, k: int, benchmark: str) -> str:
-    prefix = PARALLEL_PREFIX.format(i=i, k=k)
+    """k>1: with prefix (COLD-RL mode). k=1: no prefix (standard mode). Mirrors training."""
     instruction = _answer_instruction(benchmark)
+    if k <= 1:
+        return f"{problem}\n\n{instruction}"
+    prefix = PARALLEL_PREFIX.format(i=i, k=k)
     return f"{prefix}\n\n{problem}\n\n{instruction}"
 
 
-def _qwen_chat(system: str, user: str) -> str:
+def _no_system_chat(user: str) -> str:
+    """Chat format without system message — matches training (no system prompt)."""
     return (
-        f"<|im_start|>system\n{system}<|im_end|>\n"
         f"<|im_start|>user\n{user}<|im_end|>\n"
         f"<|im_start|>assistant\n"
     )
@@ -147,7 +150,7 @@ def eval_method_passk(
         for mid in range(1, max_k + 1):
             key = f"{p['id']}__m{mid}"
             user_content = _method_user_content(p["problem"], i=mid, k=max_k, benchmark=benchmark)
-            prompts[key] = _qwen_chat(SYSTEM_PROMPT, user_content)
+            prompts[key] = _no_system_chat(user_content)
 
     print(f"[method_eval] Running vLLM for {len(prompts)} prompts (n=1 each) ...", flush=True)
     raw = _run_vllm_worker(model, lora_path, prompts, n=1, temperature=temperature, max_tokens=max_tokens)
@@ -210,7 +213,7 @@ def eval_standard_passk(
     prompts: dict[str, str] = {}
     for p in problems:
         instruction = _answer_instruction(benchmark)
-        prompts[p["id"]] = _qwen_chat(SYSTEM_PROMPT, f"{p['problem']}\n\n{instruction}")
+        prompts[p["id"]] = _no_system_chat(f"{p['problem']}\n\n{instruction}")
 
     raw = _run_vllm_worker(model, lora_path, prompts, n=n, temperature=temperature, max_tokens=max_tokens)
 
