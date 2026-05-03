@@ -1,6 +1,6 @@
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║       COLD-RL: FINAL EXPERIMENT PLAN                                        ║
-║       A100 SXM 80GB  +  GH200 96GB (no separate eval GPU)                   ║
+║       A100 SXM 80GB  ×  2 (no separate eval GPU)                            ║
 ║       Goal: beat DARLING + ModC + Power Sampling at ALL pass@k              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
@@ -8,39 +8,31 @@ Last updated: 2026-05-03
 Status: living document — tick off runs as they complete
 
 GPU IDENTITY:
-  THIS MACHINE = A100 SXM 80GB   — runs the A-track (Qwen3-4B + ablations)
-  GH200 96GB                      — runs the G-track (Qwen2.5-7B + 3 seeds)
+  GPU-A (this machine) = A100 SXM 80GB — runs the A-track (Qwen3-4B + ablations)
+  GPU-G (second machine) = A100 SXM 80GB — runs the G-track (Qwen2.5-7B + 3 seeds)
+  Both machines are identical hardware.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SECTION 0: HARDWARE REALITY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  GH200 (96GB):
-    GPU:    H100 Hopper silicon, 96GB HBM3, 4.0 TB/s bandwidth
-    CPU:    Grace ARM, 480GB LPDDR5X (optimizer overflow via NVLink-C2C)
-    Extras: Flash Attention 3, TransformerEngine FP8, torch.compile max-autotune
-    vs A100: ~2.5-3x faster for 7B LoRA training (Hopper TFLOPS + bandwidth)
-             ~1.2x faster for 7B inference vs standalone H100
-
-  A100 SXM (80GB):
+  Both GPUs — A100 SXM (80GB):
     GPU:    Ampere, 80GB HBM2e, 2.0 TB/s bandwidth
     Extras: Flash Attention 2, BF16 training
-    Comfortable for: Qwen2.5-7B LoRA (~55GB peak), Qwen3-4B LoRA (~38GB peak)
-    Does NOT fit: Qwen3-14B LoRA (~115GB) — no 14B runs on this machine
+    Fits:   Qwen2.5-7B LoRA (~55GB peak), Qwen3-4B LoRA (~38GB peak)
+    No fit: Qwen3-14B LoRA (~115GB) — no 14B runs on either machine
 
-  TRAINING TIME ESTIMATES:
-    Model             | A100 SXM | GH200
-    ------------------+----------+-------
-    Qwen2.5-7B  GRPO  |   20h    |   8h
-    Qwen2.5-7B  LoRA  |   20h    |   8h
-    Qwen3-4B    LoRA  |   18h    |   7h
-    ModC SFT  (Qw2.5) |   18h    |   7h
-    DARLING   (Qw3-4B)|   22h    |   8h
+  TRAINING TIME ESTIMATES (per GPU):
+    Model             | A100 SXM 80GB
+    ------------------+--------------
+    Qwen2.5-7B  GRPO  |    20h
+    Qwen2.5-7B  LoRA  |    20h
+    Qwen3-4B    LoRA  |    18h
+    DARLING   (Qw3-4B)|    22h
 
-  EVAL (no separate eval GPU — runs in explicit windows after each training run):
-    Qwen2.5-7B: 500 problems x 200 samples x ~300 tokens avg
-    A100:  ~3h per full eval sweep  |  GH200: ~2h per full eval sweep
-    Eval uses ~14GB for 7B BF16 inference — fits on either GPU easily.
+  EVAL (runs in explicit windows after each training run, same GPU):
+    Qwen2.5-7B: 500 problems x 200 samples x ~300 tokens avg → ~3h per sweep
+    Eval uses ~14GB for 7B BF16 inference — fits easily.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SECTION 1: ALL 20 RUNS AT A GLANCE
@@ -49,16 +41,16 @@ SECTION 1: ALL 20 RUNS AT A GLANCE
   +----+------+--------------------+-----------------------+------+---------+
   | ID | GPU  | Model              | Algorithm             | hrs  | Purpose |
   +----+------+--------------------+-----------------------+------+---------+
-  | G1 |GH200 | Qwen2.5-7B-Base   | Zero-shot diagnostic  |  2h  | GATE    |
-  | G2 |GH200 | Qwen2.5-7B-Base   | GRPO baseline         |  8h  | CRIT.   |
-  | G3 |GH200 | Qwen2.5-7B-Base   | COLD-RL (i,k) seed 1  |  8h  | CRIT.*  |
-  | G4 |GH200 | Qwen2.5-7B-Base   | COLD-RL (i,k) seed 2  |  8h  | CRIT.   |
-  | G5 |GH200 | Qwen2.5-7B-Base   | COLD-RL (i,k) seed 3  |  8h  | CRIT.   |
-  | G6 |GH200 | Qwen2.5-7B-Base   | ModC reproduction     |  7h  | CRIT.   |
-  | G7 |GH200 | Qwen2.5-Math-7B   | COLD-RL (i,k)         |  9h  | HIGH    |
-  | G8 |GH200 | Qwen2.5-7B-Base   | GRPO 12k steps        | 12h  | HIGH    |
-  | G9 |GH200 | Qwen2.5-7B-Base   | k-schedule sparse abl.|  8h  | MEDIUM  |
-  |G10 |GH200 | --                | BUFFER / help A100    |  --  | FLEX    |
+  | G1 |GPU-G | Qwen2.5-7B-Base   | Zero-shot diagnostic  |  2h  | GATE    |
+  | G2 |GPU-G | Qwen2.5-7B-Base   | GRPO baseline         |  8h  | CRIT.   |
+  | G3 |GPU-G | Qwen2.5-7B-Base   | COLD-RL (i,k) seed 1  |  8h  | CRIT.*  |
+  | G4 |GPU-G | Qwen2.5-7B-Base   | COLD-RL (i,k) seed 2  |  8h  | CRIT.   |
+  | G5 |GPU-G | Qwen2.5-7B-Base   | COLD-RL (i,k) seed 3  |  8h  | CRIT.   |
+  | G6 |GPU-G | Qwen2.5-7B-Base   | ModC reproduction     |  7h  | CRIT.   |
+  | G7 |GPU-G | Qwen2.5-Math-7B   | COLD-RL (i,k)         |  9h  | HIGH    |
+  | G8 |GPU-G | Qwen2.5-7B-Base   | GRPO 12k steps        | 12h  | HIGH    |
+  | G9 |GPU-G | Qwen2.5-7B-Base   | k-schedule sparse abl.|  8h  | MEDIUM  |
+  |G10 |GPU-G | --                | BUFFER / help A100    |  --  | FLEX    |
   +----+------+--------------------+-----------------------+------+---------+
   | A1 | A100 | Qwen3-4B-Base     | GRPO baseline         | 18h  | CRIT.   |
   | A2 | A100 | Qwen3-4B-Base     | DARLING reproduction  | 22h  | CRIT.   |
@@ -83,7 +75,7 @@ SECTION 1: ALL 20 RUNS AT A GLANCE
 SECTION 2: RUN SPECIFICATIONS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
--- G1: ZERO-SHOT DIAGNOSTIC (GH200, 2h, inference only) ---------------------
+-- G1: ZERO-SHOT DIAGNOSTIC (GPU-G, 2h, inference only) ---------------------
   PURPOSE: Confirm "[PARALLEL SAMPLE i OF k]" prefix induces diversity in
            base model before any training. GO/NO-GO gate for G3.
   MODEL:   Qwen/Qwen2.5-7B (raw, no fine-tuning)
@@ -100,7 +92,7 @@ SECTION 2: RUN SPECIFICATIONS
   CMD:   python scripts/zero_shot_diagnostic.py \
            --model Qwen/Qwen2.5-7B --n_problems 100 --k 8
 
--- G2: GRPO BASELINE (GH200, 8h train + 2h eval = 10h) ----------------------
+-- G2: GRPO BASELINE (GPU-G, 8h train + 2h eval = 10h) ----------------------
   MODEL:   Qwen/Qwen2.5-7B
   DATA:    open-thoughts/OpenThoughts-114k + MATH train split
   ALGO:    GRPO, lambda_div=0.0
@@ -111,7 +103,7 @@ SECTION 2: RUN SPECIFICATIONS
            pass@k for k in {1,2,4,8,16,32,64,128}, n=200 per problem
   POWER SAMPLING: Apply A10 to this checkpoint immediately after eval.
 
--- G3/G4/G5: COLD-RL SEEDS 1/2/3 (GH200, 8h + 2h eval each) * --------------
+-- G3/G4/G5: COLD-RL SEEDS 1/2/3 (GPU-G, 8h + 2h eval each) * --------------
   SEEDS:    42 (G3), 1337 (G4), 0 (G5)
   MODEL:    Qwen/Qwen2.5-7B -> LoRA rank=32, alpha=64
   DATA:     Same as G2
@@ -148,7 +140,7 @@ SECTION 2: RUN SPECIFICATIONS
     Every 500 steps: r_q (k=1), r_d (k=8), pairwise dist for k in {1,4,8,16},
     pass@1 and pass@8 on 50-problem val subset. -> Figure 2 in paper.
 
--- G6: ModC REPRODUCTION (GH200, 7h train + 2h eval = 9h) ------------------
+-- G6: ModC REPRODUCTION (GPU-G, 7h train + 2h eval = 9h) ------------------
   MODEL:   Qwen/Qwen2.5-7B-Base  (SAME as G2/G3 — fair comparison)
   DATA:    open-thoughts/OpenThoughts-114k
   ALGO:    ModC with mode-specific prefix SFT distillation
@@ -158,19 +150,19 @@ SECTION 2: RUN SPECIFICATIONS
            AdamW lr=2e-5, cosine, 4 epochs — NOT RL, SFT loss
   VERIFY:  Reproduce their Table 1 pass@k within 2pp. Disclose any deviation.
 
--- G7: COLD-RL Qwen2.5-Math-7B (GH200, 9h + 2h eval) -----------------------
+-- G7: COLD-RL Qwen2.5-Math-7B (GPU-G, 9h + 2h eval) -----------------------
   MODEL:   Qwen/Qwen2.5-Math-7B
   DATA:    MATH training split (Power Sampling's exact data)
   ALGO:    Identical to G3 (same prefix, reward, curriculum)
   PURPOSE: Direct Power Sampling comparison on their exact model + data.
 
--- G8: GRPO 12k STEPS (GH200, 12h + 2h eval) --------------------------------
+-- G8: GRPO 12k STEPS (GPU-G, 12h + 2h eval) --------------------------------
   MODEL:   Qwen/Qwen2.5-7B-Base  |  ALGO: GRPO  |  STEPS: 12,000
   PURPOSE: Rules out "COLD-RL just benefits from more compute."
            If GRPO@12k ~= GRPO@8k: extra training doesn't explain gains.
   EVAL:    MATH-500 only (robustness check, not full eval)
 
--- G9: k-SCHEDULE SPARSE ABLATION (GH200, 8h + 1h eval) --------------------
+-- G9: k-SCHEDULE SPARSE ABLATION (GPU-G, 8h + 1h eval) --------------------
   MODEL:   Qwen/Qwen2.5-7B-Base
   ALGO:    G3 but Phase 2 k schedule = {1, 4, 16} (skip k=2 and k=8)
   PURPOSE: Does model need dense k coverage? Test generalization to skipped k.
@@ -259,21 +251,21 @@ SECTION 4: GANTT (both GPUs, explicit eval windows)
   Hours ->  0    12   24   36   48   60   72   84   96
             |    |    |    |    |    |    |    |    |
 
-  GH200    [G1][--G2--][ev+F5+F2][--G3s1--][ev+F3][--G3s2--][ev][--G3s3--]
+  GPU-G    [G1][--G2--][ev+F5+F2][--G3s1--][ev+F3][--G3s2--][ev][--G3s3--]
   A100     [--------A1: GRPO 4B--------][F8][-------A2: DARLING-----------]
 
   Hours ->  96  108  120  132  144  156  168  180  192
             |    |    |    |    |    |    |    |    |
 
-  GH200    [ev][--G6:ModC--][ev][--G7:Math7B--][ev][G8:12k][ev][G9:ksched]
+  GPU-G    [ev][--G6:ModC--][ev][--G7:Math7B--][ev][G8:12k][ev][G9:ksched]
   A100     [ev][-------A3: COLD-RL 4B----------][ev][A4:SoftTok][ev][A5]
 
   KEY MILESTONES:
     Hour 2:   G1 GO/NO-GO decision on (i,k) prefix
-    Hour 43:  3 COLD-RL seeds done on GH200 -> mean+/-std ready
+    Hour 43:  3 COLD-RL seeds done on GPU-G -> mean+/-std ready
     Hour 47:  A2 DARLING done -> DARLING comparison baseline ready
     Hour 69:  A3 COLD-RL 4B done -> DARLING beaten at all k
-    Hour 86:  GH200 primary queue done -> all main results available
+    Hour 86:  GPU-G primary queue done -> all main results available
     Hour 94:  *** START WRITING THE PAPER ***
     Hour ~170: All ablations complete
 
@@ -370,7 +362,7 @@ SECTION 8: RISKS AND MITIGATIONS
   ACTION:  Report deviation explicitly. Comparison against reproduced baseline is valid.
 
   RISK 4: A100 ablations exceed time budget
-  ACTION:  GH200 picks up A7 and A8 after hour 86 (G10 buffer). Priority: A4 > A5 > A7 > A8.
+  ACTION:  GPU-G picks up A7 and A8 after hour 86 (G10 buffer). Priority: A4 > A5 > A7 > A8.
 
   RISK 5: COLD-RL loses to ModC at pass@1
   ACTION:  Extend Phase 1 to 5500 steps. If still losing at pass@1, report honestly.
