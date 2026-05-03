@@ -75,8 +75,8 @@ def parse_args() -> DiversityGRPOConfig:
     p = argparse.ArgumentParser(description="Diversity-GRPO training")
 
     # Model
-    p.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct",
-                   dest="model_name", help="HuggingFace model ID")
+    p.add_argument("--model", default="Qwen/Qwen2.5-7B",
+                   dest="model_name", help="HuggingFace model ID (use BASE, never -Instruct)")
     # Data
     p.add_argument("--dataset", default="gsm8k",
                    help="Dataset name (gsm8k | math | ...)")
@@ -93,7 +93,18 @@ def parse_args() -> DiversityGRPOConfig:
 
     # Reward
     p.add_argument("--lambda_div", type=float, default=0.5,
-                   help="Weight for diversity reward (added to correctness reward)")
+                   help="Fixed diversity weight (used when alpha_diversity not set)")
+    p.add_argument("--alpha_diversity", type=float, default=0.3,
+                   help="Alpha for k-dependent lambda(k) = alpha*log(k)/log(k_max). "
+                        "Set to 0 to use fixed --lambda_div instead.")
+    p.add_argument("--k_max_training", type=int, default=16,
+                   help="k_max for lambda(k) normalisation")
+    p.add_argument("--phase1_steps", type=int, default=4000,
+                   help="Steps of Phase 1 (k=1 only, pure quality). "
+                        "Phase 2 starts at step phase1_steps+1 with varied k.")
+    p.add_argument("--k_values", default="1,2,4,8,16",
+                   help="Comma-separated Phase 2 k schedule (default: 1,2,4,8,16). "
+                        "E.g. --k_values 1,4,16 for sparse ablation (G9).")
     p.add_argument("--embed_model", default="openrouter",
                    choices=["openrouter", "local"],
                    help="Embedding model: openrouter=Qwen3-Embed-8B, local=MiniLM")
@@ -137,7 +148,9 @@ def parse_args() -> DiversityGRPOConfig:
     p.add_argument("--seed", type=int, default=42)
 
     args = p.parse_args()
-    return DiversityGRPOConfig(**vars(args))
+    d = vars(args)
+    d["k_training_values"] = [int(x) for x in d.pop("k_values").split(",")]
+    return DiversityGRPOConfig(**d)
 
 
 if __name__ == "__main__":

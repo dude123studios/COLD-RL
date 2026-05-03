@@ -38,10 +38,14 @@ def main():
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
 
+    import torch
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    gpu_util = 0.70 if total_gb >= 70 else 0.40
+
     llm_kwargs = dict(
         model=args.model,
         tensor_parallel_size=1,
-        gpu_memory_utilization=0.40,
+        gpu_memory_utilization=gpu_util,
         max_model_len=8192,
         enforce_eager=True,
         disable_log_stats=True,

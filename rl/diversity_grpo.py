@@ -23,6 +23,7 @@ Hyperparameters follow DARLING (arXiv:2509.02534):
 import gc
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -43,34 +44,44 @@ logger = logging.getLogger(__name__)
 # Prompt formatting
 # ---------------------------------------------------------------------------
 
-METHOD_SYSTEM_PROMPT = (
-    "You are a brilliant mathematician. You will be shown a math problem and "
-    "asked to solve it using a specific solution approach. Think step by step."
-)
+SYSTEM_PROMPT = "You are a helpful assistant. Think step by step."
 
-METHOD_PROMPT_TEMPLATE = (
-    "Solve the following problem using mathematical approach #{method_id} of {n_methods} "
-    "(each approach should be conceptually distinct — e.g., algebraic, geometric, "
-    "number-theoretic, direct computation, etc.).\n\n"
-    "Problem: {problem}\n\n"
-    "Approach #{method_id}: Solve this step by step and conclude with "
-    "\\boxed{{your final answer}}."
-)
+# "[PARALLEL SAMPLE {i} OF {k}]" prepended as plain text before the problem.
+# k=1,i=1 -> quality-only mode (no diversity role).
+# k=8,i=3 -> third of 8 independent parallel solvers.
+# The model learns what role i-of-k means purely from the reward signal.
+# Do NOT add explicit mode labels or strategy hints — roles are implicit.
+PARALLEL_PREFIX = "[PARALLEL SAMPLE {i} OF {k}]"
 
 
-def format_method_prompt(problem: str, method_id: int, n_methods: int = 8) -> str:
-    return METHOD_PROMPT_TEMPLATE.format(
-        method_id=method_id,
-        n_methods=n_methods,
-        problem=problem,
-    )
+def lambda_fn(k: int, alpha: float = 0.3, k_max: int = 16) -> float:
+    """k-dependent diversity weight. lambda(1) == 0 exactly."""
+    if k <= 1:
+        return 0.0
+    val = alpha * (math.log(k) / math.log(k_max))
+    assert abs(lambda_fn.__wrapped__(1, alpha, k_max)) < 1e-9 if hasattr(lambda_fn, "__wrapped__") else True
+    return val
+
+
+# Attach sentinel for the assert in lambda_fn itself
+lambda_fn.__wrapped__ = lambda k, a, km: (0.0 if k <= 1 else a * (math.log(k) / math.log(km)))
+assert abs(lambda_fn(1)) < 1e-9, "lambda(1) must be exactly zero"
+
+
+# Phase 2 k values — sampled uniformly each batch
+K_TRAINING_VALUES = [1, 2, 4, 8, 16]
+
+
+def format_problem_prompt(problem: str, i: int, k: int) -> str:
+    prefix = PARALLEL_PREFIX.format(i=i, k=k)
+    return f"{prefix}\n\n{problem}\n\nSolve this step by step and conclude with \\boxed{{your final answer}}."
 
 
 def build_chat_prompt(tokenizer, problem: str, method_id: int, n_methods: int = 8) -> str:
-    """Build the full chat-formatted prompt string."""
+    """Build chat-formatted prompt. method_id=i, n_methods=k."""
     messages = [
-        {"role": "system", "content": METHOD_SYSTEM_PROMPT},
-        {"role": "user", "content": format_method_prompt(problem, method_id, n_methods)},
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": format_problem_prompt(problem, method_id, n_methods)},
     ]
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -128,8 +139,10 @@ def create_vllm_engine(
     # vLLM compares driver free to (gpu_memory_utilization * total) at startup, but
     # the worker process can still OOM while loading weights + KV if util is too
     # aggressive for fragmented post-teardown memory — cap util and retry lower.
-    slack_gb = 2.5
-    util_cap = 0.38
+    # Tune util_cap based on total VRAM: 80GB A100 can use 0.65, 48GB cards stay at 0.38
+    total_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    util_cap = 0.65 if total_vram_gb >= 70 else 0.38
+    slack_gb = 4.0 if total_vram_gb >= 70 else 2.5
     util_floor = 0.20
     max_attempts = 6
     scale_retry = 0.88
@@ -652,19 +665,24 @@ def save_checkpoint(model, tokenizer, path: Path, step: int, metrics: dict):
 @dataclass
 class DiversityGRPOConfig:
     # Model
-    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
+    model_name: str = "Qwen/Qwen2.5-7B"  # BASE model — never use -Instruct
     # Data
     dataset: str = "gsm8k"
     dataset_path: Optional[str] = None
     benchmark: str = "gsm8k"
     # Rollouts (from DARLING)
-    n_rollouts: int = 8          # N methods per problem = N rollouts per group
-    temperature: float = 0.8
+    n_rollouts: int = 8          # N parallel samples per problem per step
+    temperature: float = 1.0     # 1.0 during training (DARLING default)
     max_new_tokens: int = 8192
-    # Reward
-    lambda_div: float = 0.5      # weight on diversity reward
-    embed_model: str = "openrouter"  # "openrouter" | "local"
-    use_xml_steps: bool = False  # False = fast sentence splitting
+    # Reward — COLD-RL (i,k) design
+    lambda_div: float = 0.5      # legacy fixed-lambda fallback (ignored when alpha_diversity set)
+    alpha_diversity: float = 0.3  # alpha in lambda(k) = alpha * log(k) / log(k_max)
+    k_max_training: int = 16      # k_max for lambda(k) normalisation
+    embed_model: str = "local"    # "local" = e5-small-v2; "openrouter" = Qwen3-Embed-8B
+    use_xml_steps: bool = False
+    # Two-phase curriculum
+    phase1_steps: int = 4000     # steps with k=1 only (pure quality, lambda=0)
+    k_training_values: list = field(default_factory=lambda: [1, 2, 4, 8, 16])  # Phase 2 k schedule
     # GRPO hyperparams (from DARLING paper)
     lr: float = 1e-6
     warmup_ratio: float = 0.1
@@ -913,18 +931,30 @@ def train(cfg: DiversityGRPOConfig):
         # Sample batch of problems (without replacement within epoch)
         batch = random.sample(problems, min(cfg.n_problems_per_step, len(problems)))
 
-        # ── 1. Build all rollout prompts ─────────────────────────────────────
+        # ── 1. Determine Phase and k for this step ───────────────────────────
+        # Phase 1 (steps 1..phase1_steps): k=1, pure quality, lambda=0.
+        # Phase 2 (steps phase1_steps+1..total_steps): k ~ Uniform{k_training_values}.
+        if global_step < cfg.phase1_steps:
+            step_k = 1
+        else:
+            step_k = random.choice(cfg.k_training_values)
+        step_lambda = lambda_fn(step_k, cfg.alpha_diversity, cfg.k_max_training)
+
+        # ── 2. Build all rollout prompts ─────────────────────────────────────
+        # Always generate n_rollouts completions per problem for stable GRPO groups.
+        # Role indices cycle through 1..step_k when n_rollouts > step_k.
         flat_prompts: list[str] = []
         flat_meta: list[dict] = []   # {problem_idx, method_id, gold_answer}
 
         for pidx, prob in enumerate(batch):
-            for method_id in range(1, cfg.n_rollouts + 1):
+            for slot in range(cfg.n_rollouts):
+                role_i = (slot % step_k) + 1  # cycles 1..step_k
                 flat_prompts.append(
-                    build_chat_prompt(tokenizer, prob["problem"], method_id, cfg.n_rollouts)
+                    build_chat_prompt(tokenizer, prob["problem"], role_i, step_k)
                 )
                 flat_meta.append({
                     "problem_idx": pidx,
-                    "method_id": method_id,
+                    "method_id": role_i,
                     "gold_answer": prob["answer"],
                     "problem_id": prob["id"],
                 })
@@ -979,7 +1009,7 @@ def train(cfg: DiversityGRPOConfig):
                     completions=group_comps,
                     gold_answer=prob["answer"],
                     benchmark=cfg.benchmark,
-                    lambda_div=cfg.lambda_div,
+                    lambda_div=step_lambda,
                     embed_model=cfg.embed_model,
                     use_xml_steps=cfg.use_xml_steps,
                 )
@@ -1030,6 +1060,9 @@ def train(cfg: DiversityGRPOConfig):
 
         metrics = {
             "step": global_step,
+            "phase": 1 if global_step <= cfg.phase1_steps else 2,
+            "k": step_k,
+            "lambda": round(step_lambda, 4),
             "loss": float(loss_val),
             "n_correct": n_correct,
             "n_total": n_total,
