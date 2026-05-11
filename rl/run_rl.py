@@ -68,7 +68,7 @@ logging.basicConfig(
 )
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from rl.diversity_grpo import DiversityGRPOConfig, train
+from rl.diversity_grpo import DiversityGRPOConfig, find_latest_checkpoint, train
 
 
 def parse_args() -> DiversityGRPOConfig:
@@ -138,7 +138,7 @@ def parse_args() -> DiversityGRPOConfig:
 
     # Output
     p.add_argument("--output_dir", default="results/rl_runs/div_grpo")
-    p.add_argument("--save_every", type=int, default=100)
+    p.add_argument("--save_every", type=int, default=50)
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--resume_from", default=None,
                    help="Path to a checkpoint dir (step_XXXXX/) with LoRA adapter + metrics.json")
@@ -155,6 +155,19 @@ def parse_args() -> DiversityGRPOConfig:
 
 if __name__ == "__main__":
     cfg = parse_args()
+
+    # Auto-resume: if no explicit --resume_from but checkpoints exist, pick the latest.
+    if cfg.resume_from is None:
+        latest = find_latest_checkpoint(Path(cfg.output_dir))
+        if latest is not None:
+            import logging as _log
+            _log.getLogger(__name__).info(
+                f"[auto-resume] Found checkpoint {latest.name} in {cfg.output_dir} — resuming"
+            )
+            cfg.resume_from = str(latest)
+        else:
+            import logging as _log
+            _log.getLogger(__name__).info("[auto-resume] No checkpoint found — starting fresh")
 
     print("=" * 60)
     print("Diversity-GRPO Training")

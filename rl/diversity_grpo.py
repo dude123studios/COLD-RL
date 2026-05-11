@@ -26,6 +26,10 @@ import logging
 import math
 import os
 import random
+import shutil
+import signal
+import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +42,20 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Graceful-preemption support
+# ---------------------------------------------------------------------------
+
+_STOP_EVENT = threading.Event()
+
+
+def _install_sigterm_handler() -> None:
+    """Set _STOP_EVENT on SIGTERM so the training loop can checkpoint and exit."""
+    def _handler(signum, frame):
+        logger.info("[signal] SIGTERM received — will checkpoint and exit after current step")
+        _STOP_EVENT.set()
+    signal.signal(signal.SIGTERM, _handler)
 
 
 # ---------------------------------------------------------------------------
@@ -652,14 +670,47 @@ def eval_pass_at_k(
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, tokenizer, path: Path, step: int, metrics: dict):
+def save_checkpoint(
+    model,
+    tokenizer,
+    path: Path,
+    step: int,
+    metrics: dict,
+    optimizer=None,
+    scheduler=None,
+) -> Path:
     ckpt_dir = path / f"step_{step:05d}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(ckpt_dir))
     tokenizer.save_pretrained(str(ckpt_dir))
+    if optimizer is not None:
+        torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
+    if scheduler is not None:
+        torch.save(scheduler.state_dict(), ckpt_dir / "scheduler.pt")
     with open(ckpt_dir / "metrics.json", "w") as f:
         json.dump({"step": step, **metrics}, f, indent=2)
     logger.info(f"[ckpt] Saved checkpoint → {ckpt_dir}")
+    return ckpt_dir
+
+
+def prune_old_checkpoints(output_dir: Path, keep: int = 2) -> None:
+    """Delete all but the `keep` most recent step_XXXXX checkpoints."""
+    ckpts = sorted(
+        (p for p in output_dir.glob("step_*") if p.is_dir()),
+        key=lambda p: int(p.name.split("_")[1]),
+    )
+    for old in ckpts[:-keep]:
+        shutil.rmtree(old, ignore_errors=True)
+        logger.info(f"[ckpt] Pruned old checkpoint: {old.name}")
+
+
+def find_latest_checkpoint(output_dir: Path) -> Optional[Path]:
+    """Return the path of the latest valid step_XXXXX checkpoint, or None."""
+    ckpts = sorted(
+        (p for p in output_dir.glob("step_*") if p.is_dir() and (p / "metrics.json").exists()),
+        key=lambda p: int(p.name.split("_")[1]),
+    )
+    return ckpts[-1] if ckpts else None
 
 
 # ---------------------------------------------------------------------------
@@ -706,7 +757,7 @@ class DiversityGRPOConfig:
     lora_dropout: float = 0.05
     # Checkpointing & logging
     output_dir: str = "results/rl_runs"
-    save_every: int = 100
+    save_every: int = 50
     log_every: int = 10
     # Resume: path to a saved step_XXXXX/ folder (LoRA adapter + tokenizer)
     resume_from: Optional[str] = None
@@ -817,6 +868,9 @@ def _load_from_hf(dataset: str) -> list[dict]:
 def train(cfg: DiversityGRPOConfig):
     from peft import LoraConfig, get_peft_model, TaskType
 
+    _STOP_EVENT.clear()
+    _install_sigterm_handler()
+
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -889,9 +943,22 @@ def train(cfg: DiversityGRPOConfig):
     cosine_sched = CosineAnnealingLR(optimizer, T_max=cfg.total_steps - warmup_steps, eta_min=0.0)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched],
                               milestones=[warmup_steps])
-    # Align LR schedule to resume step (optimizer state is fresh; LR curve matches step)
-    for _ in range(start_step):
-        scheduler.step()
+
+    if cfg.resume_from:
+        resume_path = Path(cfg.resume_from).resolve()
+        opt_path = resume_path / "optimizer.pt"
+        sch_path = resume_path / "scheduler.pt"
+        if opt_path.exists() and sch_path.exists():
+            logger.info(f"[init] Restoring optimizer + scheduler state from {resume_path}")
+            optimizer.load_state_dict(torch.load(opt_path, map_location="cpu"))
+            scheduler.load_state_dict(torch.load(sch_path))
+        else:
+            # Checkpoint predates optimizer-state saving — fast-forward LR curve only
+            logger.warning("[init] No optimizer.pt found — fast-forwarding LR schedule only")
+            for _ in range(start_step):
+                scheduler.step()
+    else:
+        pass  # fresh run; scheduler starts at step 0
 
     # ── Data ─────────────────────────────────────────────────────────────────
     problems = load_problems(cfg.dataset, cfg.dataset_path)
@@ -900,6 +967,7 @@ def train(cfg: DiversityGRPOConfig):
     from rl.diversity_reward import compute_group_rewards
 
     global_step = start_step
+    last_metrics: dict = {}
     if start_step >= cfg.total_steps:
         logger.warning(f"[train] start_step {start_step} >= total_steps {cfg.total_steps}; nothing to do.")
         return model, tokenizer
@@ -922,6 +990,15 @@ def train(cfg: DiversityGRPOConfig):
     lora_slot_counter = start_step  # monotonically incrementing LoRA slot ID
 
     while global_step < cfg.total_steps:
+        # SIGTERM received between steps — checkpoint completed work and yield node back.
+        if _STOP_EVENT.is_set():
+            logger.info("[train] SIGTERM — saving checkpoint and exiting cleanly")
+            save_checkpoint(model, tokenizer, output_dir, global_step, last_metrics,
+                            optimizer=optimizer, scheduler=scheduler)
+            prune_old_checkpoints(output_dir, keep=2)
+            destroy_vllm_engine(persistent_llm)
+            sys.exit(0)
+
         t0 = time.time()
 
         if persistent_llm is None:
@@ -1076,6 +1153,8 @@ def train(cfg: DiversityGRPOConfig):
             "elapsed_s": round(elapsed, 1),
         }
 
+        last_metrics = metrics
+
         if global_step % cfg.log_every == 0:
             logger.info(
                 f"[step {global_step:4d}/{cfg.total_steps}] "
@@ -1089,41 +1168,49 @@ def train(cfg: DiversityGRPOConfig):
             with open(log_path, "a") as f:
                 f.write(json.dumps(metrics) + "\n")
 
-        if global_step % cfg.save_every == 0:
-            # Save model weights
-            save_checkpoint(model, tokenizer, output_dir, global_step, metrics)
+        # Checkpoint on schedule OR immediately if SIGTERM arrived during this step.
+        if global_step % cfg.save_every == 0 or _STOP_EVENT.is_set():
+            ckpt_dir = save_checkpoint(model, tokenizer, output_dir, global_step, metrics,
+                                       optimizer=optimizer, scheduler=scheduler)
+            prune_old_checkpoints(output_dir, keep=2)
 
-            # COLD eval: pass@16 via approaches #1->8 x 2 (controllable diversity)
-            logger.info(f"[eval] Running COLD pass@16 eval at step {global_step}...")
-            tmp_ckpt = output_dir / f"step_{global_step:05d}"
-            lora_slot_counter += 1
-            try:
-                eval_metrics = eval_pass_at_k(
-                    cfg=cfg,
-                    tokenizer=tokenizer,
-                    lora_adapter_dir=str(tmp_ckpt),
-                    problems=problems,
-                    n_eval=min(50, len(problems)),
-                    approach_cycles=2,
-                    gpu_id=0,
-                    training_model=model,
-                    llm=None,
-                    lora_slot_id=lora_slot_counter,
-                )
-                metrics.update(eval_metrics)
-                # Overwrite metrics.json with eval scores included
-                with open(tmp_ckpt / "metrics.json", "w") as f:
-                    json.dump({"step": global_step, **metrics}, f, indent=2)
-                logger.info(
-                    f"[eval] pass@1={eval_metrics['pass@1']:.2%}  "
-                    f"pass@8={eval_metrics['pass@8']:.2%}  "
-                    f"pass@16={eval_metrics['pass@16']:.2%}"
-                )
-            except Exception as e:
-                logger.warning(f"[eval] pass@k eval failed (non-fatal): {e}")
+            # Skip eval on SIGTERM — save time, get out quickly.
+            if not _STOP_EVENT.is_set():
+                logger.info(f"[eval] Running COLD pass@16 eval at step {global_step}...")
+                lora_slot_counter += 1
+                try:
+                    eval_metrics = eval_pass_at_k(
+                        cfg=cfg,
+                        tokenizer=tokenizer,
+                        lora_adapter_dir=str(ckpt_dir),
+                        problems=problems,
+                        n_eval=min(50, len(problems)),
+                        approach_cycles=2,
+                        gpu_id=0,
+                        training_model=model,
+                        llm=None,
+                        lora_slot_id=lora_slot_counter,
+                    )
+                    metrics.update(eval_metrics)
+                    with open(ckpt_dir / "metrics.json", "w") as f:
+                        json.dump({"step": global_step, **metrics}, f, indent=2)
+                    logger.info(
+                        f"[eval] pass@1={eval_metrics['pass@1']:.2%}  "
+                        f"pass@8={eval_metrics['pass@8']:.2%}  "
+                        f"pass@16={eval_metrics['pass@16']:.2%}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[eval] pass@k eval failed (non-fatal): {e}")
+
+            if _STOP_EVENT.is_set():
+                logger.info("[train] SIGTERM — clean exit after mid-step checkpoint")
+                destroy_vllm_engine(persistent_llm)
+                sys.exit(0)
 
     # Final checkpoint + eval
-    save_checkpoint(model, tokenizer, output_dir, global_step, metrics)
+    save_checkpoint(model, tokenizer, output_dir, global_step, last_metrics,
+                    optimizer=optimizer, scheduler=scheduler)
+    prune_old_checkpoints(output_dir, keep=2)
     destroy_vllm_engine(persistent_llm)
     persistent_llm = None
     torch.cuda.empty_cache()
