@@ -34,6 +34,24 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # i=1 → no prefix; i>1 → "[Attempt #i — use a new method]"
 from rl.diversity_grpo import ATTEMPT_PREFIX, MATH_INSTRUCTION
 
+
+def _resolve_lora_path(lora_path: Optional[str]) -> Optional[str]:
+    """If lora_path is a training output dir, resolve to the latest step_XXXXX/ checkpoint."""
+    if lora_path is None:
+        return None
+    p = Path(lora_path)
+    if (p / "adapter_config.json").exists():
+        return lora_path
+    step_dirs = sorted(
+        [d for d in p.glob("step_*") if d.is_dir()],
+        key=lambda d: int(d.name.split("_")[1]),
+    )
+    if step_dirs:
+        resolved = str(step_dirs[-1])
+        print(f"[lora_path] {lora_path} → {resolved}", flush=True)
+        return resolved
+    return lora_path
+
 _ANSWER_INSTRUCTION = {
     "default":        MATH_INSTRUCTION,
     "gpqa_diamond":   "Please reason step by step, then state your final answer as a single letter (A, B, C, or D) on the last line.",
@@ -253,6 +271,8 @@ def run_full_eval(
     out_path: Optional[str] = None,
 ) -> dict:
     from evaluation.vllm_generate import load_benchmark
+
+    lora_path = _resolve_lora_path(lora_path)
 
     out_path = out_path or f"results/passk/{experiment_id}.json"
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)

@@ -40,6 +40,24 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+
+def _resolve_lora_path(lora_path):
+    """If lora_path is a training output dir, resolve to the latest step_XXXXX/ checkpoint."""
+    if lora_path is None:
+        return None
+    p = Path(lora_path)
+    if (p / "adapter_config.json").exists():
+        return lora_path
+    step_dirs = sorted(
+        [d for d in p.glob("step_*") if d.is_dir()],
+        key=lambda d: int(d.name.split("_")[1]),
+    )
+    if step_dirs:
+        resolved = str(step_dirs[-1])
+        logger.info(f"[calib] lora_path {lora_path} → {resolved}")
+        return resolved
+    return lora_path
+
 from rl.diversity_grpo import ATTEMPT_PREFIX, MATH_INSTRUCTION, I_ROLLOUTS
 
 logger = logging.getLogger(__name__)
@@ -174,6 +192,7 @@ def run_calibration(
       meta       : run metadata
     """
     import subprocess, tempfile
+    lora_path = _resolve_lora_path(lora_path)
 
     N = len(problems)
     logger.info(f"[calib] {N} problems × {I} indices × {R} draws = {N*I*R} total completions")
