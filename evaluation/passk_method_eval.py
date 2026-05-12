@@ -201,6 +201,20 @@ def eval_method_passk(
         results[f"pass_at_{k}"] = float(np.mean(vals))
         print(f"  [method] pass@{k:2d} = {results[f'pass_at_{k}']:.4f}", flush=True)
 
+    # Build per-problem trace dict for full analysis later
+    traces: dict[str, list[dict]] = {}
+    for p in problems:
+        traces[p["id"]] = [
+            {
+                "method_id": mid,
+                "prompt": prompts.get(f"{p['id']}__m{mid}", ""),
+                "response": by_problem[p["id"]][mid - 1],
+                "correct": per_problem_correct[p["id"]][mid - 1],
+                "answer": p["answer"],
+            }
+            for mid in range(1, max_k + 1)
+        ]
+
     return {
         "mode": "method",
         "benchmark": benchmark,
@@ -209,6 +223,7 @@ def eval_method_passk(
         "temperature": temperature,
         "metrics": results,
         "per_problem_n_correct": {pid: int(sum(c)) for pid, c in per_problem_correct.items()},
+        "traces": traces,
     }
 
 
@@ -250,6 +265,21 @@ def eval_standard_passk(
         results[f"pass_at_{k}"] = float(np.mean(vals))
         print(f"  [standard] pass@{k:2d} = {results[f'pass_at_{k}']:.4f}", flush=True)
 
+    # Full traces for later analysis
+    traces: dict[str, list[dict]] = {}
+    for p in problems:
+        resps = raw.get(p["id"], [])
+        traces[p["id"]] = [
+            {
+                "sample_idx": idx,
+                "prompt": prompts[p["id"]],
+                "response": r,
+                "correct": per_problem_correct[p["id"]][idx] if idx < len(per_problem_correct[p["id"]]) else False,
+                "answer": p["answer"],
+            }
+            for idx, r in enumerate(resps)
+        ]
+
     return {
         "mode": "standard",
         "benchmark": benchmark,
@@ -258,6 +288,7 @@ def eval_standard_passk(
         "temperature": temperature,
         "metrics": results,
         "per_problem_n_correct": {pid: int(sum(c)) for pid, c in per_problem_correct.items()},
+        "traces": traces,
     }
 
 
@@ -311,9 +342,21 @@ def run_full_eval(
             n=max_k, max_tokens=max_tokens, temperature=0.8,
         )
 
+        # Save full traces to a separate file (can be hundreds of MB)
+        traces_path = Path(out_path).with_suffix("") / f"traces_{bmark}.json"
+        traces_path.parent.mkdir(parents=True, exist_ok=True)
+        traces_path.write_text(json.dumps({
+            "experiment_id": experiment_id,
+            "benchmark": bmark,
+            "method_traces": method_res.pop("traces", {}),
+            "standard_traces": standard_res.pop("traces", {}),
+        }, indent=2))
+        print(f"[passk_eval] Traces saved → {traces_path}", flush=True)
+
         result["benchmarks"][bmark] = {
             "method": method_res,
             "standard": standard_res,
+            "traces_path": str(traces_path),
         }
 
         # Print comparison table

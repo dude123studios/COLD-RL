@@ -26,12 +26,44 @@ SUBMIT_LOG="${SLOG}/submit_$(date +%Y%m%d_%H%M%S).log"
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "${SUBMIT_LOG}"; }
 
 CONDA_INIT="source /home/shivansg/miniconda/etc/profile.d/conda.sh && conda activate env"
-HF_EXPORTS="export HF_HOME=/data/user_data/shivansg/.hf_cache HF_DATASETS_CACHE=/data/user_data/shivansg/.hf_cache/datasets HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false TRITON_CACHE_DIR=/data/user_data/shivansg/triton_cache"
+HF_EXPORTS="[[ -f \${HOME}/.hf_token ]] && source \${HOME}/.hf_token; export HF_HOME=/data/hf_cache HF_DATASETS_CACHE=/data/hf_cache/datasets HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false TRITON_CACHE_DIR=\${SCRATCH:-/tmp}/triton_cache_\${SLURM_JOB_ID}; mkdir -p \${TRITON_CACHE_DIR}"
+
+# ---------------------------------------------------------------------------
+# submit_cleanup: free disk space in /data/user_data/shivansg by removing
+# the old .hf_cache (models move to /data/hf_cache) and stale run artifacts.
+# ---------------------------------------------------------------------------
+submit_cleanup() {
+    sbatch --parsable \
+        --job-name="cold-cleanup" \
+        --partition=cpu \
+        --cpus-per-task=4 \
+        --mem=8G \
+        --time=1:00:00 \
+        --output="${SLOG}/cold-cleanup-%j.out" \
+        --error="${SLOG}/cold-cleanup-%j.err" \
+        --wrap="
+set -e
+echo '[cleanup] Starting disk cleanup...'
+df -h /data/user_data/shivansg /data/hf_cache 2>/dev/null || true
+echo '[cleanup] Removing old HF caches from user_data (all moving to /data/hf_cache)...'
+rm -rf /data/user_data/shivansg/.hf_cache 2>/dev/null || true
+rm -rf /data/user_data/shivansg/HF 2>/dev/null || true
+rm -rf /data/user_data/shivansg/hf 2>/dev/null || true
+rm -rf /data/user_data/shivansg/triton_cache 2>/dev/null || true
+rm -rf /data/user_data/shivansg/triton 2>/dev/null || true
+echo '[cleanup] Done. Free space:'
+df -h /data/user_data/shivansg /data/hf_cache 2>/dev/null || true
+"
+}
 
 # ---------------------------------------------------------------------------
 # submit_setup: download all models + datasets to /data HF cache
 # ---------------------------------------------------------------------------
 submit_setup() {
+    local dep_jid="${1:-}"
+    local dep_flag=""
+    [[ -n "${dep_jid}" ]] && dep_flag="--dependency=afterok:${dep_jid}"
+
     sbatch --parsable \
         --job-name="cold-setup" \
         --partition=cpu \
@@ -40,19 +72,21 @@ submit_setup() {
         --time=12:00:00 \
         --output="${SLOG}/cold-setup-%j.out" \
         --error="${SLOG}/cold-setup-%j.err" \
+        ${dep_flag} \
         --wrap="
 set -e
 ${CONDA_INIT}
-export HF_HOME=/data/user_data/shivansg/.hf_cache
-export HF_DATASETS_CACHE=/data/user_data/shivansg/.hf_cache/datasets
+[[ -f "${HOME}/.hf_token" ]] && source "${HOME}/.hf_token"
+export HF_HOME=/data/hf_cache
+export HF_DATASETS_CACHE=/data/hf_cache/datasets
 export TOKENIZERS_PARALLELISM=false
-mkdir -p \${HF_HOME}
+mkdir -p \${HF_HOME} \${HF_DATASETS_CACHE}
 cd ${REPO_DIR}
-echo '[setup] Downloading models and datasets to /data HF cache...'
+echo '[setup] Downloading models and datasets to /data/hf_cache...'
 python3 - <<'PYEOF'
 import os, sys
-os.environ.setdefault('HF_HOME', '/data/user_data/shivansg/.hf_cache')
-os.environ.setdefault('HF_DATASETS_CACHE', '/data/user_data/shivansg/.hf_cache/datasets')
+os.environ.setdefault('HF_HOME', '/data/hf_cache')
+os.environ.setdefault('HF_DATASETS_CACHE', '/data/hf_cache/datasets')
 from huggingface_hub import snapshot_download
 from datasets import load_dataset
 
@@ -63,6 +97,7 @@ models = [
     'Qwen/Qwen2.5-0.5B',
     'Qwen/Qwen2.5-7B-Instruct',
     'intfloat/e5-small-v2',
+    'Qwen/Qwen3-Embedding-0.6B',
 ]
 for m in models:
     print(f'[setup] Downloading model {m} ...', flush=True)
@@ -219,10 +254,17 @@ python3 -m evaluation.water_filling \
 }
 
 # ===========================================================================
+# Cleanup — free disk space by removing old HF cache from /data/user_data
+# ===========================================================================
+log "=== Cleanup: freeing disk space ==="
+JID_CLEANUP=$(submit_cleanup)
+log "  cleanup → job ${JID_CLEANUP}"
+
+# ===========================================================================
 # Setup — download all models and datasets before any training starts
 # ===========================================================================
 log "=== Setup: downloading models + datasets ==="
-JID_SETUP=$(submit_setup)
+JID_SETUP=$(submit_setup "${JID_CLEANUP}")
 log "  setup → job ${JID_SETUP}"
 
 # ===========================================================================

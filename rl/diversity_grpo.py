@@ -623,7 +623,7 @@ def eval_pass_at_k(
         for cycle in range(approach_cycles):
             for method_id in range(1, n_methods + 1):
                 flat_prompts.append(
-                    build_chat_prompt(tokenizer, prob["problem"], method_id, n_methods)
+                    build_chat_prompt(tokenizer, prob["problem"], method_id)
                 )
                 flat_gold.append(prob["answer"])
 
@@ -1212,5 +1212,32 @@ def train(cfg: DiversityGRPOConfig):
     destroy_vllm_engine(persistent_llm)
     persistent_llm = None
     torch.cuda.empty_cache()
+
+    # Push final LoRA adapter to HF Hub for persistent off-node storage.
+    # Token sourced from HF_TOKEN env var (set in submit.sh from ~/.hf_token).
+    hf_token = os.environ.get("HF_TOKEN", "")
+    if hf_token:
+        try:
+            from huggingface_hub import HfApi
+            run_name = Path(cfg.output_dir).name
+            repo_id = f"shivansg/{run_name}"
+            logger.info(f"[hub] Pushing final LoRA to {repo_id} ...")
+            final_ckpt = find_latest_checkpoint(output_dir)
+            if final_ckpt is None:
+                final_ckpt = output_dir
+            api = HfApi(token=hf_token)
+            api.create_repo(repo_id, repo_type="model", exist_ok=True, private=True)
+            api.upload_folder(
+                folder_path=str(final_ckpt),
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=f"Final LoRA checkpoint — step {global_step}",
+            )
+            logger.info(f"[hub] Upload complete → {repo_id}")
+        except Exception as e:
+            logger.warning(f"[hub] Push failed (non-fatal): {e}")
+    else:
+        logger.info("[hub] HF_TOKEN not set — skipping Hub push")
+
     logger.info("[train] Done.")
     return model, tokenizer

@@ -55,11 +55,11 @@ def parse_args() -> DiversityGRPOConfig:
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--max_new_tokens", type=int, default=8192)
 
-    # Embedding for diversity reward (spec: Qwen3-8B; local for practical cluster use)
-    p.add_argument("--embed_model", default="local",
-                   choices=["local", "qwen3", "openrouter"],
-                   help="local=e5-small-v2 (fast); qwen3=Qwen3-Embedding (spec); "
-                        "openrouter=API (requires OPENROUTER_API_KEY)")
+    # Embedding for diversity reward (spec: Qwen3-8B; qwen3-small for practical cluster use)
+    p.add_argument("--embed_model", default="qwen3-small",
+                   choices=["local", "qwen3-small", "qwen3", "openrouter"],
+                   help="local=e5-small-v2 CPU; qwen3-small=Qwen3-Embedding-0.6B (default); "
+                        "qwen3=Qwen3-Embedding 8B (spec); openrouter=API")
 
     # GRPO hyperparams (spec §1.6)
     p.add_argument("--lr", type=float, default=1e-5,

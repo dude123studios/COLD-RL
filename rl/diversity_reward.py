@@ -71,7 +71,8 @@ def _extract_reasoning_trace(response: str) -> str:
 # ---------------------------------------------------------------------------
 
 _LOCAL_EMBED_MODEL = None
-_QWEN3_EMBED_BUNDLE = None  # (tokenizer, model)
+_QWEN3_EMBED_BUNDLE = None        # (tokenizer, model) for Qwen3-Embedding 8B
+_QWEN3_SMALL_EMBED_BUNDLE = None  # (tokenizer, model) for Qwen3-Embedding-0.6B
 
 
 def _get_local_model():
@@ -134,6 +135,47 @@ def _embed_qwen3(traces: list[str]) -> np.ndarray:
     return np.concatenate(all_embs, axis=0).astype(np.float32)
 
 
+def _embed_qwen3_small(traces: list[str]) -> np.ndarray:
+    """Qwen3-Embedding-0.6B — same API as _embed_qwen3 but cheaper."""
+    global _QWEN3_SMALL_EMBED_BUNDLE
+    import torch
+    from transformers import AutoTokenizer, AutoModel
+
+    if _QWEN3_SMALL_EMBED_BUNDLE is None:
+        tok = AutoTokenizer.from_pretrained(
+            "Qwen/Qwen3-Embedding-0.6B", trust_remote_code=True
+        )
+        mdl = AutoModel.from_pretrained(
+            "Qwen/Qwen3-Embedding-0.6B",
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        mdl.eval()
+        _QWEN3_SMALL_EMBED_BUNDLE = (tok, mdl)
+
+    tok, mdl = _QWEN3_SMALL_EMBED_BUNDLE
+    device = next(mdl.parameters()).device
+    all_embs: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for start in range(0, len(traces), 16):
+            batch = traces[start : start + 16]
+            enc = tok(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            ).to(device)
+            hidden = mdl(**enc).last_hidden_state[:, 0, :]  # [CLS] pooling
+            hidden = hidden.float().cpu().numpy()
+            norms = np.linalg.norm(hidden, axis=1, keepdims=True) + 1e-8
+            all_embs.append(hidden / norms)
+
+    return np.concatenate(all_embs, axis=0).astype(np.float32)
+
+
 def _embed_openrouter(traces: list[str]) -> np.ndarray:
     import os, time
     import openai
@@ -170,14 +212,17 @@ def embed_traces(traces: list[str], embed_model: str = "local") -> np.ndarray:
     Embed reasoning traces. Returns (N, d) L2-normalized float32 array.
 
     embed_model options:
-      "local"      — intfloat/e5-small-v2 on CPU  (fast, no extra GPU needed)
-      "qwen3"      — Qwen/Qwen3-Embedding on GPU   (spec requirement)
-      "openrouter" — Qwen3-Embedding-8B via API    (requires OPENROUTER_API_KEY)
+      "local"       — intfloat/e5-small-v2 on CPU    (fast, no extra GPU)
+      "qwen3-small" — Qwen/Qwen3-Embedding-0.6B GPU  (good quality, cheap)
+      "qwen3"       — Qwen/Qwen3-Embedding 8B GPU    (spec requirement)
+      "openrouter"  — Qwen3-Embedding-8B via API     (requires OPENROUTER_API_KEY)
     """
     if not traces:
         return np.zeros((0, 384), dtype=np.float32)
     if embed_model == "local":
         return _embed_local(traces)
+    if embed_model == "qwen3-small":
+        return _embed_qwen3_small(traces)
     if embed_model == "qwen3":
         return _embed_qwen3(traces)
     if embed_model == "openrouter":

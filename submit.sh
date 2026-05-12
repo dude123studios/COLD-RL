@@ -33,7 +33,7 @@ DATASET="${DATASET:-numinamath}"
 BENCHMARK="${BENCHMARK:-math}"
 N_EPOCHS="${N_EPOCHS:-8}"
 LR="${LR:-1e-5}"             # 1e-5 for 7B; 1e-4 for ≤3B
-EMBED_MODEL="${EMBED_MODEL:-local}"
+EMBED_MODEL="${EMBED_MODEL:-qwen3-small}"
 OUTPUT_DIR="${OUTPUT_DIR:-/data/user_data/shivansg/cold_rl_runs/cold_rl_main}"
 SEED="${SEED:-42}"
 GRPO_BASELINE="${GRPO_BASELINE:-}"   # set to "--grpo_baseline" for λ=0 runs
@@ -49,12 +49,17 @@ conda activate env
 
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
-export HF_HOME=/data/user_data/shivansg/.hf_cache
-export HF_DATASETS_CACHE=/data/user_data/shivansg/.hf_cache/datasets
+export HF_HOME=/data/hf_cache
+export HF_DATASETS_CACHE=/data/hf_cache/datasets
 export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
-# Write triton autotune cache to /data to avoid NFS-related hangs on job exit.
-export TRITON_CACHE_DIR=/data/user_data/shivansg/triton_cache
+# Triton autotune cache: use /scratch (fast local NVMe, avoids NFS hangs).
+# Falls back to /tmp if /scratch unavailable on this node.
+export TRITON_CACHE_DIR="${SCRATCH:-/tmp}/triton_cache_${SLURM_JOB_ID}"
+mkdir -p "${TRITON_CACHE_DIR}"
+
+# HF Hub token for final model push — sourced from ~/.hf_token, never hardcoded.
+[[ -f "${HOME}/.hf_token" ]] && source "${HOME}/.hf_token"
 
 mkdir -p "${OUTPUT_DIR}"
 
