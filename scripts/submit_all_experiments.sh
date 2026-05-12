@@ -36,7 +36,7 @@ submit_train() {
     shift 3
     local extra_env="${*:-}"   # optional "KEY=VALUE ..." to append to --export
 
-    local export_str="ALL,MODEL=${model},LR=${lr},OUTPUT_DIR=${BASE_DIR}/${name}"
+    local export_str="ALL,REPO_DIR=${REPO_DIR},MODEL=${model},LR=${lr},OUTPUT_DIR=${BASE_DIR}/${name}"
     [[ -n "${extra_env}" ]] && export_str="${export_str},${extra_env}"
 
     sbatch --parsable \

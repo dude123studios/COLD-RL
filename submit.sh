@@ -60,7 +60,9 @@ export TOKENIZERS_PARALLELISM=false
 
 mkdir -p "${OUTPUT_DIR}"
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# SLURM copies this script to its spool dir, so BASH_SOURCE[0] won't point
+# back to the repo. Prefer the REPO_DIR env var exported by submit_all_experiments.sh.
+REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 cd "${REPO_DIR}"
 
 # ── Graceful SIGTERM handler ──────────────────────────────────────────────────
