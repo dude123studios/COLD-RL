@@ -18,9 +18,12 @@ set -euo pipefail
 
 BASE_DIR="/data/user_data/shivansg/cold_rl_runs"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG_DIR="${BASE_DIR}/logs"
-mkdir -p "${LOG_DIR}"
-SUBMIT_LOG="${LOG_DIR}/submit.log"
+# SLURM job stdout/stderr goes here — compute nodes write to /data; login node writes submit log to /home
+SLURM_LOG_DIR="${BASE_DIR}/logs"           # created by first compute job
+LOCAL_LOG_DIR="${HOME}/cold_rl_submit_logs" # login-node writable
+mkdir -p "${LOCAL_LOG_DIR}"
+SUBMIT_LOG="${LOCAL_LOG_DIR}/submit.log"
+LOG_DIR="${SLURM_LOG_DIR}"   # used in sbatch --output lines (compute nodes create it)
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "${SUBMIT_LOG}"; }
 
@@ -33,7 +36,7 @@ submit_train() {
     local extra_env=("$@")   # KEY=VALUE pairs to export
 
     local out_dir="${BASE_DIR}/${name}"
-    mkdir -p "${out_dir}"
+    # out_dir is on /data — created by the compute job itself via submit.sh
 
     # Build export string
     local exports="ALL,MODEL=${model},LR=${lr},OUTPUT_DIR=${out_dir}"
