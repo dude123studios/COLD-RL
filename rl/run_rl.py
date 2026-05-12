@@ -1,59 +1,24 @@
 """
-Entry point for Diversity-GRPO training.
+Entry point for COLD-RL training.
 
-Thesis: Controllable Diversity
-  Standard RL (GRPO) + correctness reward → diversity collapse: the model
-  always produces the same solution. We want diversity ON DEMAND — when the
-  user asks for "approach #X", the model produces a genuinely different method.
-
-  Our reward teaches the model two things simultaneously:
-    1. Correctness: solve the problem right
-    2. Uniqueness of method: the approach you use must be distinct from all
-       other methods used in the same rollout group
-
-  At inference time, diversity is CONTROLLABLE:
-    - Use standard prompt → model produces best answer (no diversity cost)
-    - Use "approach #1 of 8" prompts → model produces 8 diverse correct solutions
-
-  This is stronger than DARLING, which trains a ALWAYS-diverse model.
-  Our method trains an ON-DEMAND-diverse model.
-
-Supported datasets:
-  - gsm8k       (7.5K training problems, local or HuggingFace)
-  - math        (7.5K MATH training set, HuggingFace lighteval/MATH)
-  - deepscaler  (10K competition math, HuggingFace agentica-org/DeepScaleR-Preview-Dataset)
-                 — THIS is what DARLING trains on (Qwen3-4B-Base, 64 GPUs)
-  - aime        (AI-MO AIME validation set)
-  - Any .jsonl with 'problem'+'answer' fields via --dataset_path
-
-Recommended for best results (hardest problems → most room for diverse methods):
-  deepscaler > math > gsm8k
-
-DARLING hyperparameters (from arXiv:2509.02534):
-  --model Qwen/Qwen3-4B     (DARLING uses Qwen3-4B-Base)
-  --n_rollouts 8
-  --lr 1e-6
-  --n_problems_per_step 32  (32 × 8 = 256 global batch)
-  --max_new_tokens 8192
-  --clip_eps 0.2
-  --kl_beta 0.001
-  --temperature 0.8
+Spec §1.6 defaults:
+  I=16 rollouts, batch=256 (16 problems × 16 rollouts)
+  LR: 1e-5 for 7B; 1e-4 for ≤3B
+  β=0.01, ε=0.2, λ=0.5 (post-ramp), 8 epochs
+  Data: NuminaMath (short-CoT) or OpenThoughts-3 (long-CoT)
 
 Usage:
-    # Primary experiment (OpenRouter embeddings)
-    OPENROUTER_API_KEY=... python -m rl.run_rl \
-        --model Qwen/Qwen2.5-7B-Instruct \
-        --dataset deepscaler \
-        --lambda_div 0.5 \
-        --embed_model openrouter \
-        --gpu_id 2 \
-        --output_dir results/rl_runs/div_grpo_7b_deepscaler
+    # E1 — 7B primary
+    python -m rl.run_rl --model Qwen/Qwen2.5-7B --lr 1e-5 \
+        --output_dir /data/user_data/shivansg/cold_rl_runs/e1_7b
 
-    # Free ablation (local embeddings, no API cost)
-    python -m rl.run_rl --embed_model local --lambda_div 0.5 ...
+    # E1 — 0.5B
+    python -m rl.run_rl --model Qwen/Qwen2.5-0.5B --lr 1e-4 \
+        --output_dir /data/user_data/shivansg/cold_rl_runs/e1_0p5b
 
-    # GRPO-only baseline (lambda=0, for comparison)
-    python -m rl.run_rl --embed_model local --lambda_div 0.0 ...
+    # GRPO baseline (λ=0, epoch 1 only has λ=0 anyway but set n_epochs too)
+    python -m rl.run_rl --model Qwen/Qwen2.5-7B --grpo_baseline \
+        --output_dir /data/user_data/shivansg/cold_rl_runs/grpo_baseline_7b
 """
 
 import argparse
@@ -72,63 +37,49 @@ from rl.diversity_grpo import DiversityGRPOConfig, find_latest_checkpoint, train
 
 
 def parse_args() -> DiversityGRPOConfig:
-    p = argparse.ArgumentParser(description="Diversity-GRPO training")
+    p = argparse.ArgumentParser(description="COLD-RL training")
 
     # Model
-    p.add_argument("--model", default="Qwen/Qwen2.5-7B",
-                   dest="model_name", help="HuggingFace model ID (use BASE, never -Instruct)")
-    # Data
-    p.add_argument("--dataset", default="gsm8k",
-                   help="Dataset name (gsm8k | math | ...)")
-    p.add_argument("--dataset_path", default=None,
-                   help="Override path to .jsonl file with 'problem'/'answer' fields")
-    p.add_argument("--benchmark", default="gsm8k",
-                   help="Benchmark name for answer grading")
+    p.add_argument("--model", default="Qwen/Qwen2.5-7B", dest="model_name",
+                   help="HuggingFace model ID. Use BASE models for RL training.")
 
-    # Rollouts (DARLING defaults)
-    p.add_argument("--n_rollouts", type=int, default=8,
-                   help="Number of diverse rollouts per problem (= N methods)")
-    p.add_argument("--temperature", type=float, default=0.8)
+    # Data (spec §1.6)
+    p.add_argument("--dataset", default="numinamath",
+                   help="numinamath | openthoughts3 | math | deepscaler | gsm8k | <path>")
+    p.add_argument("--dataset_path", default=None)
+    p.add_argument("--benchmark", default="math",
+                   help="Benchmark for answer grading during training spot-checks")
+
+    # Rollouts (spec §1.2: I=16 fixed)
+    p.add_argument("--n_rollouts", type=int, default=16)
+    p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--max_new_tokens", type=int, default=8192)
 
-    # Reward
-    p.add_argument("--lambda_div", type=float, default=0.5,
-                   help="Fixed diversity weight (used when alpha_diversity not set)")
-    p.add_argument("--alpha_diversity", type=float, default=0.3,
-                   help="Alpha for k-dependent lambda(k) = alpha*log(k)/log(k_max). "
-                        "Set to 0 to use fixed --lambda_div instead.")
-    p.add_argument("--k_max_training", type=int, default=16,
-                   help="k_max for lambda(k) normalisation")
-    p.add_argument("--phase1_steps", type=int, default=4000,
-                   help="Steps of Phase 1 (k=1 only, pure quality). "
-                        "Phase 2 starts at step phase1_steps+1 with varied k.")
-    p.add_argument("--k_values", default="1,2,4,8,16",
-                   help="Comma-separated Phase 2 k schedule (default: 1,2,4,8,16). "
-                        "E.g. --k_values 1,4,16 for sparse ablation (G9).")
-    p.add_argument("--embed_model", default="openrouter",
-                   choices=["openrouter", "local"],
-                   help="Embedding model: openrouter=Qwen3-Embed-8B, local=MiniLM")
-    p.add_argument("--use_xml_steps", action="store_true",
-                   help="Extract steps via XML parsing (requires model to output <step> tags)")
+    # Embedding for diversity reward (spec: Qwen3-8B; local for practical cluster use)
+    p.add_argument("--embed_model", default="local",
+                   choices=["local", "qwen3", "openrouter"],
+                   help="local=e5-small-v2 (fast); qwen3=Qwen3-Embedding (spec); "
+                        "openrouter=API (requires OPENROUTER_API_KEY)")
 
-    # GRPO hyperparams (DARLING)
-    p.add_argument("--lr", type=float, default=1e-6)
-    p.add_argument("--warmup_ratio", type=float, default=0.1)
+    # GRPO hyperparams (spec §1.6)
+    p.add_argument("--lr", type=float, default=1e-5,
+                   help="1e-5 for 7B; 1e-4 for ≤3B (spec §1.6)")
+    p.add_argument("--warmup_ratio", type=float, default=0.05)
     p.add_argument("--clip_eps", type=float, default=0.2)
-    p.add_argument("--kl_beta", type=float, default=0.001)
+    p.add_argument("--kl_beta", type=float, default=0.01)
 
-    # Training schedule
-    p.add_argument("--n_problems_per_step", type=int, default=32,
-                   help="Problems per gradient step (×N rollouts = global batch size)")
-    p.add_argument("--mini_batch", type=int, default=8,
-                   help="Completions per backward pass (controls activation memory). "
-                        "Use 8 on 48GB GPUs when vLLM shares the device; raise on 80GB if stable.")
-    p.add_argument("--ref_batch_size", type=int, default=2,
-                   help="Sequences per batched reference log-prob forward pass (no grad). "
-                        "Small values (2–4) avoid lm_head logits OOM on 48GB cards.")
-    p.add_argument("--total_steps", type=int, default=1000)
+    # Training schedule (spec §1.6: 8 epochs, batch=256)
+    p.add_argument("--n_epochs", type=int, default=8)
+    p.add_argument("--n_problems_per_step", type=int, default=16,
+                   help="16 problems × 16 rollouts = 256 completions per step")
+    p.add_argument("--mini_batch", type=int, default=8)
+    p.add_argument("--ref_batch_size", type=int, default=4)
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
+
+    # GRPO-only baseline convenience flag (forces λ=0 for all epochs)
+    p.add_argument("--grpo_baseline", action="store_true",
+                   help="Run pure GRPO (λ=0). Overrides epoch curriculum to keep λ=0.")
 
     # LoRA
     p.add_argument("--use_lora", action="store_true", default=True)
@@ -137,11 +88,10 @@ def parse_args() -> DiversityGRPOConfig:
     p.add_argument("--lora_alpha", type=int, default=128)
 
     # Output
-    p.add_argument("--output_dir", default="results/rl_runs/div_grpo")
+    p.add_argument("--output_dir", default="results/rl_runs/cold_rl")
     p.add_argument("--save_every", type=int, default=50)
     p.add_argument("--log_every", type=int, default=10)
-    p.add_argument("--resume_from", default=None,
-                   help="Path to a checkpoint dir (step_XXXXX/) with LoRA adapter + metrics.json")
+    p.add_argument("--resume_from", default=None)
 
     # Hardware
     p.add_argument("--gpu_id", type=int, default=0)
@@ -149,41 +99,44 @@ def parse_args() -> DiversityGRPOConfig:
 
     args = p.parse_args()
     d = vars(args)
-    d["k_training_values"] = [int(x) for x in d.pop("k_values").split(",")]
+
+    # --grpo_baseline: monkey-patch _lambda_for_epoch to always return 0
+    grpo_baseline = d.pop("grpo_baseline", False)
+    if grpo_baseline:
+        import rl.diversity_grpo as _dg
+        _dg._lambda_for_epoch = lambda epoch: 0.0
+
     return DiversityGRPOConfig(**d)
 
 
 if __name__ == "__main__":
     cfg = parse_args()
 
-    # Auto-resume: if no explicit --resume_from but checkpoints exist, pick the latest.
+    # Auto-resume: find latest checkpoint in output_dir if not explicitly given
     if cfg.resume_from is None:
         latest = find_latest_checkpoint(Path(cfg.output_dir))
         if latest is not None:
-            import logging as _log
-            _log.getLogger(__name__).info(
-                f"[auto-resume] Found checkpoint {latest.name} in {cfg.output_dir} — resuming"
+            logging.getLogger(__name__).info(
+                f"[auto-resume] Found {latest.name} — resuming"
             )
             cfg.resume_from = str(latest)
         else:
-            import logging as _log
-            _log.getLogger(__name__).info("[auto-resume] No checkpoint found — starting fresh")
+            logging.getLogger(__name__).info("[auto-resume] Starting fresh")
 
     print("=" * 60)
-    print("Diversity-GRPO Training")
+    print("COLD-RL Training")
     print("=" * 60)
-    print(f"  Model:         {cfg.model_name}")
-    print(f"  Dataset:       {cfg.dataset}")
-    print(f"  N rollouts:    {cfg.n_rollouts}  (method prompts 1..{cfg.n_rollouts})")
-    print(f"  lambda_div:    {cfg.lambda_div}")
-    print(f"  embed_model:   {cfg.embed_model}")
-    print(f"  LR:            {cfg.lr}")
-    print(f"  Steps:         {cfg.total_steps}")
-    print(f"  Global batch:  {cfg.n_problems_per_step} probs × {cfg.n_rollouts} rollouts = "
-          f"{cfg.n_problems_per_step * cfg.n_rollouts} completions")
-    print(f"  Output:        {cfg.output_dir}")
+    print(f"  Model:       {cfg.model_name}")
+    print(f"  Dataset:     {cfg.dataset}")
+    print(f"  Rollouts:    {cfg.n_rollouts}  (I=16 per spec)")
+    print(f"  Epochs:      {cfg.n_epochs}  (λ: 0→0.17→0.33→0.50)")
+    print(f"  Embed:       {cfg.embed_model}")
+    print(f"  LR:          {cfg.lr}")
+    print(f"  Batch:       {cfg.n_problems_per_step} × {cfg.n_rollouts} = "
+          f"{cfg.n_problems_per_step * cfg.n_rollouts} completions/step")
+    print(f"  Output:      {cfg.output_dir}")
     if cfg.resume_from:
-        print(f"  Resume:        {cfg.resume_from}")
+        print(f"  Resume:      {cfg.resume_from}")
     print("=" * 60)
 
     train(cfg)

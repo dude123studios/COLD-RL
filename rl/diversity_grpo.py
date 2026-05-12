@@ -62,48 +62,43 @@ def _install_sigterm_handler() -> None:
 # Prompt formatting
 # ---------------------------------------------------------------------------
 
-# No system prompt — matches DARLING / DeepScaleR training format exactly.
-# Adding a system message would diverge from the baseline we compare against.
-PARALLEL_PREFIX = "[PARALLEL SAMPLE {i} OF {k}]"
+# Spec §1.1: "[Attempt #i — use a new method]\n\n{problem}" for i>1; no prefix for i=1.
+ATTEMPT_PREFIX = "[Attempt #{i} — use a new method]"
 
-# Standard math instruction suffix — same wording used across DeepScaleR ecosystem.
+# Standard math instruction suffix.
 MATH_INSTRUCTION = "Please reason step by step, and put your final answer within \\boxed{}."
 
+# Number of parallel attempts per problem (fixed at I=16 per spec).
+I_ROLLOUTS = 16
 
-def lambda_fn(k: int, alpha: float = 0.3, k_max: int = 16) -> float:
-    """k-dependent diversity weight. lambda(1) == 0 exactly."""
-    if k <= 1:
+
+def _lambda_for_epoch(epoch: int) -> float:
+    """Spec §1.4: λ curriculum across epochs."""
+    if epoch <= 1:
         return 0.0
-    val = alpha * (math.log(k) / math.log(k_max))
-    assert abs(lambda_fn.__wrapped__(1, alpha, k_max)) < 1e-9 if hasattr(lambda_fn, "__wrapped__") else True
-    return val
+    if epoch == 2:
+        return 0.17
+    if epoch == 3:
+        return 0.33
+    return 0.50   # epoch 4+
 
 
-# Attach sentinel for the assert in lambda_fn itself
-lambda_fn.__wrapped__ = lambda k, a, km: (0.0 if k <= 1 else a * (math.log(k) / math.log(km)))
-assert abs(lambda_fn(1)) < 1e-9, "lambda(1) must be exactly zero"
-
-
-# Phase 2 k values — sampled uniformly each batch
-K_TRAINING_VALUES = [1, 2, 4, 8, 16]
-
-
-def format_problem_prompt(problem: str, i: int, k: int) -> str:
+def format_problem_prompt(problem: str, i: int) -> str:
     """
-    k=1: no prefix — standard quality-only prompt identical to DARLING baseline.
-    k>1: [PARALLEL SAMPLE i OF k] prefix — controllable diversity mode.
-    No prefix at k=1 means "standard mode" at inference too (no prefix = best answer).
+    i=1: no prefix (standard mode, identical to base GRPO).
+    i>1: [Attempt #i — use a new method] prefix.
+    Spec §1.1: prefix is omitted entirely for i=1.
     """
-    if k <= 1:
+    if i <= 1:
         return f"{problem}\n\n{MATH_INSTRUCTION}"
-    prefix = PARALLEL_PREFIX.format(i=i, k=k)
+    prefix = ATTEMPT_PREFIX.format(i=i)
     return f"{prefix}\n\n{problem}\n\n{MATH_INSTRUCTION}"
 
 
-def build_chat_prompt(tokenizer, problem: str, method_id: int, n_methods: int = 8) -> str:
-    """Build chat-formatted prompt. method_id=i, n_methods=k."""
+def build_chat_prompt(tokenizer, problem: str, attempt_id: int) -> str:
+    """Build chat-formatted prompt for attempt attempt_id ∈ {1,...,I}."""
     messages = [
-        {"role": "user", "content": format_problem_prompt(problem, method_id, n_methods)},
+        {"role": "user", "content": format_problem_prompt(problem, attempt_id)},
     ]
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
@@ -348,21 +343,18 @@ def generate_rollouts(
 def compute_grpo_advantages(
     rewards: list[float],
     n_rollouts: int,
-    eps: float = 1e-8,
 ) -> list[float]:
     """
-    Standard GRPO: normalize rewards within each group of n_rollouts.
-    rewards is a flat list [g0_r0, g0_r1, ..., g0_rN, g1_r0, ...]
-    Returns advantages in same order.
+    COLD-RL spec §1.5: A_i = r_i − mean_j(r_j).
+    No standard-deviation normalization (diverges from standard GRPO).
     """
     advantages = []
     n_groups = len(rewards) // n_rollouts
     for g in range(n_groups):
-        group = rewards[g * n_rollouts: (g + 1) * n_rollouts]
-        mean_r = np.mean(group)
-        std_r = np.std(group) + eps
+        group = rewards[g * n_rollouts : (g + 1) * n_rollouts]
+        mean_r = float(np.mean(group))
         for r in group:
-            advantages.append((r - mean_r) / std_r)
+            advantages.append(r - mean_r)
     return advantages
 
 
@@ -485,32 +477,44 @@ def grpo_loss_and_backward(
     advantages: list[float],
     ref_log_probs: list[torch.Tensor],
     clip_eps: float = 0.2,
-    kl_beta: float = 0.001,
+    kl_beta: float = 0.01,
     device: str = "cuda",
     grad_accum: int = 1,
     mini_batch: int = 16,
+    total_tokens: int = 0,
 ) -> float:
     """
-    Compute GRPO loss and immediately call backward() on each mini-batch.
+    COLD-RL spec §1.5: token-level loss averaging.
 
-    Gradient note: the gradient is computed ONLY over the completion tokens.
-    The prompt tokens (which include the "Approach #X" conditioning) are included
-    in the forward pass for attention context but are masked out of the loss
-    via the [prompt_len - 1:] slice.  This ensures the policy update teaches the
-    model *how* to answer a given approach, not *which* approach to pick.
+    Loss = (1/Σ|y_i|) · Σ_{i,t} clip(IS_{i,t}, 1-ε, 1+ε) · A_i  −  β·KL
 
-    Memory note: accumulating ALL 256 computation graphs before backward() causes
-    OOM on 48GB GPUs with long completions.  Instead, we process `mini_batch`
-    completions at a time and immediately call backward(), accumulating the
-    weight gradients rather than the activation graphs.
+    Instead of averaging per-sequence and then averaging sequences, we SUM
+    per-token losses across all rollouts and divide by total_tokens.  This
+    gives equal weight to every token in the batch regardless of sequence length.
+
+    Memory: mini-batch backward so only mini_batch activation graphs live in
+    memory at once.  Gradients accumulate across mini-batches.
     """
+    if total_tokens <= 0:
+        # Pre-compute total completion token count for scaling
+        for prompt, completion in zip(prompts, completions):
+            if not completion.strip():
+                continue
+            prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids[0]
+            full_ids = tokenizer(
+                prompt + completion, return_tensors="pt",
+                truncation=True, max_length=8192,
+            ).input_ids[0]
+            total_tokens += max(0, len(full_ids) - len(prompt_ids))
+    if total_tokens == 0:
+        total_tokens = 1  # guard against all-empty batch
+
     total_loss_val = 0.0
-    count = 0
     n = len(prompts)
 
     for batch_start in range(0, n, mini_batch):
         batch_end = min(batch_start + mini_batch, n)
-        batch_losses: list[torch.Tensor] = []
+        token_losses: list[torch.Tensor] = []   # per-token sum (not mean)
 
         for prompt, completion, adv, ref_lp in zip(
             prompts[batch_start:batch_end],
@@ -530,7 +534,6 @@ def grpo_loss_and_backward(
             logits = out.logits[0, :-1, :]
             targets = input_ids[0, 1:]
             log_p = torch.nn.functional.log_softmax(logits, dim=-1)
-            # Gradient only over completion tokens (prompt tokens masked out)
             curr_log_probs = log_p[torch.arange(len(targets)), targets][prompt_len - 1:]
 
             T = min(len(curr_log_probs), len(ref_lp))
@@ -538,38 +541,36 @@ def grpo_loss_and_backward(
                 continue
 
             curr = curr_log_probs[:T]
-            ref = ref_lp[:T].to(device)
+            ref  = ref_lp[:T].to(device)
 
             log_ratio = curr - ref.detach()
-            ratio = log_ratio.exp()
+            ratio     = log_ratio.exp()
 
-            adv_t = torch.tensor(adv, device=device)
+            adv_t   = torch.tensor(adv, device=device, dtype=torch.float32)
             clipped = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
-            policy_loss = -torch.min(ratio * adv_t, clipped * adv_t).mean()
 
-            # Per-token KL: ref_log_prob - curr_log_prob (expected under ref)
-            kl = (ref.detach().exp() * (ref.detach() - curr)).mean()
+            # Token-level policy loss — SUM across tokens (not mean)
+            policy_token_loss = -torch.min(ratio * adv_t, clipped * adv_t)
+            kl_token = ref.detach().exp() * (ref.detach() - curr)
 
-            batch_losses.append(policy_loss + kl_beta * kl)
-            count += 1
+            token_losses.append(
+                (policy_token_loss + kl_beta * kl_token).sum()
+            )
 
-        if not batch_losses:
+        if not token_losses:
             continue
 
-        # Backward immediately — only this mini-batch's activations are in memory
-        mb_loss = torch.stack(batch_losses).mean()
-        total_loss_val += float(mb_loss.item())
-        # Scale by mini_batch / n so that each sample contributes equally,
-        # and by 1/grad_accum for the outer gradient accumulation.
-        scale = (len(batch_losses) / max(count, 1)) / grad_accum
-        (mb_loss * scale).backward()
+        mb_token_sum = torch.stack(token_losses).sum()
+        total_loss_val += float(mb_token_sum.item())
 
-    if count == 0:
-        # No valid completions at all — emit a zero-grad dummy step
+        # Scale: divide by total_tokens (global normalization) and grad_accum
+        (mb_token_sum / (total_tokens * grad_accum)).backward()
+
+    if total_loss_val == 0.0:
         dummy = next(p for p in model.parameters() if p.requires_grad)
         (dummy.sum() * 0.0 / grad_accum).backward()
 
-    return total_loss_val / max(count // mini_batch, 1)
+    return total_loss_val / total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -719,38 +720,32 @@ def find_latest_checkpoint(output_dir: Path) -> Optional[Path]:
 
 @dataclass
 class DiversityGRPOConfig:
-    # Model
-    model_name: str = "Qwen/Qwen2.5-7B"  # BASE model — never use -Instruct
-    # Data
-    dataset: str = "gsm8k"
+    # Model (spec §1.6: Qwen2.5-Base 0.5B/1.5B/3B/7B or OLMo2 1B/7B)
+    model_name: str = "Qwen/Qwen2.5-7B"
+    # Data (spec §1.6: NuminaMath short-CoT, OpenThoughts-3 long-CoT)
+    dataset: str = "numinamath"
     dataset_path: Optional[str] = None
-    benchmark: str = "gsm8k"
-    # Rollouts (from DARLING)
-    n_rollouts: int = 8          # N parallel samples per problem per step
-    temperature: float = 1.0     # 1.0 during training (DARLING default)
-    max_new_tokens: int = 8192
-    # Reward — COLD-RL (i,k) design
-    lambda_div: float = 0.5      # legacy fixed-lambda fallback (ignored when alpha_diversity set)
-    alpha_diversity: float = 0.3  # alpha in lambda(k) = alpha * log(k) / log(k_max)
-    k_max_training: int = 16      # k_max for lambda(k) normalisation
-    embed_model: str = "local"    # "local" = e5-small-v2; "openrouter" = Qwen3-Embed-8B
-    use_xml_steps: bool = False
-    # Two-phase curriculum
-    phase1_steps: int = 4000     # steps with k=1 only (pure quality, lambda=0)
-    k_training_values: list = field(default_factory=lambda: [1, 2, 4, 8, 16])  # Phase 2 k schedule
-    # GRPO hyperparams (from DARLING paper)
-    lr: float = 1e-6
-    warmup_ratio: float = 0.1
-    clip_eps: float = 0.2
-    kl_beta: float = 0.001
-    # Training schedule
-    n_problems_per_step: int = 32    # B = 32 problems × 8 rollouts = 256 global batch
-    mini_batch: int = 8              # completions per backward pass (memory control)
-    ref_batch_size: int = 2          # batched ref log-prob (keep small when co-locating vLLM)
-    total_steps: int = 1000
+    benchmark: str = "math"
+    # Rollouts (spec §1.2: I=16 fixed)
+    n_rollouts: int = I_ROLLOUTS     # 16 attempts per problem
+    temperature: float = 1.0
+    max_new_tokens: int = 8192       # spec §1.6
+    # Reward (spec §1.4)
+    embed_model: str = "local"       # "local" | "qwen3" | "openrouter"
+    # Training epochs (spec §1.6: 8 epochs; lambda ramps per epoch via _lambda_for_epoch)
+    n_epochs: int = 8
+    # GRPO hyperparams (spec §1.6)
+    lr: float = 1e-5                 # 1e-5 for 7B; override to 1e-4 for ≤3B
+    warmup_ratio: float = 0.05
+    clip_eps: float = 0.2            # ε
+    kl_beta: float = 0.01            # β
+    # Batch (spec §1.6: batch=256 = 16 problems × 16 rollouts)
+    n_problems_per_step: int = 16    # 16 × 16 = 256 completions per step
+    mini_batch: int = 8              # completions per backward pass
+    ref_batch_size: int = 4
     grad_accum: int = 1
     max_grad_norm: float = 1.0
-    # LoRA (LoRA keeps memory manageable)
+    # LoRA
     use_lora: bool = True
     lora_r: int = 64
     lora_alpha: int = 128
@@ -759,7 +754,6 @@ class DiversityGRPOConfig:
     output_dir: str = "results/rl_runs"
     save_every: int = 50
     log_every: int = 10
-    # Resume: path to a saved step_XXXXX/ folder (LoRA adapter + tokenizer)
     resume_from: Optional[str] = None
     # Hardware
     gpu_id: int = 0
@@ -833,12 +827,15 @@ def _load_from_hf(dataset: str) -> list[dict]:
 
     # Dataset name → (hf_name, split, problem_col, answer_col)
     HF_MAP = {
-        "gsm8k":       ("openai/gsm8k", "train", "main", "question", "answer"),
-        "math":        ("lighteval/MATH", "train", None, "problem", "solution"),
-        "math500":     ("lighteval/MATH", "test", None, "problem", "solution"),
-        "deepscaler":  ("agentica-org/DeepScaleR-Preview-Dataset", "train", None, "problem", "answer"),
-        "aime":        ("AI-MO/aimo-validation-aime", "train", None, "problem", "answer"),
-        "competition": ("deepmind/mathematics_dataset", "train", None, "question", "answer"),
+        # Spec §1.6 primary training sets
+        "numinamath":     ("AI-MO/NuminaMath-CoT", "train", None, "problem", "solution"),
+        "openthoughts3":  ("open-thoughts/OpenThoughts-3", "train", None, "problem", "solution"),
+        # Legacy / eval sets
+        "gsm8k":          ("openai/gsm8k", "train", "main", "question", "answer"),
+        "math":           ("lighteval/MATH", "train", None, "problem", "solution"),
+        "math500":        ("lighteval/MATH", "test", None, "problem", "solution"),
+        "deepscaler":     ("agentica-org/DeepScaleR-Preview-Dataset", "train", None, "problem", "answer"),
+        "aime":           ("AI-MO/aimo-validation-aime", "train", None, "problem", "answer"),
     }
 
     if dataset not in HF_MAP:
@@ -933,16 +930,13 @@ def train(cfg: DiversityGRPOConfig):
     model.enable_input_require_grads()
 
     # ── Optimizer & scheduler ────────────────────────────────────────────────
+    # total_steps derived from epochs × dataset size at runtime (after data load)
+    # We initialize the scheduler with a placeholder and rebuild after loading data.
     optimizer = AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=cfg.lr,
         weight_decay=0.0,
     )
-    warmup_steps = int(cfg.total_steps * cfg.warmup_ratio)
-    warmup_sched = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
-    cosine_sched = CosineAnnealingLR(optimizer, T_max=cfg.total_steps - warmup_steps, eta_min=0.0)
-    scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched],
-                              milestones=[warmup_steps])
 
     if cfg.resume_from:
         resume_path = Path(cfg.resume_from).resolve()
@@ -962,14 +956,45 @@ def train(cfg: DiversityGRPOConfig):
 
     # ── Data ─────────────────────────────────────────────────────────────────
     problems = load_problems(cfg.dataset, cfg.dataset_path)
+    random.shuffle(problems)
+
+    # Derive total_steps from epochs × dataset (spec §1.6: 8 epochs)
+    steps_per_epoch = max(1, len(problems) // cfg.n_problems_per_step)
+    total_steps = steps_per_epoch * cfg.n_epochs
+    logger.info(
+        f"[train] {len(problems)} problems  |  {steps_per_epoch} steps/epoch  |  "
+        f"{cfg.n_epochs} epochs  |  {total_steps} total steps"
+    )
+
+    warmup_steps = max(1, int(total_steps * cfg.warmup_ratio))
+    warmup_sched = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+    cosine_sched = CosineAnnealingLR(
+        optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=0.0
+    )
+    scheduler = SequentialLR(
+        optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_steps]
+    )
+
+    if cfg.resume_from:
+        resume_path = Path(cfg.resume_from).resolve()
+        opt_path = resume_path / "optimizer.pt"
+        sch_path = resume_path / "scheduler.pt"
+        if opt_path.exists() and sch_path.exists():
+            logger.info(f"[init] Restoring optimizer + scheduler state from {resume_path}")
+            optimizer.load_state_dict(torch.load(opt_path, map_location="cpu"))
+            scheduler.load_state_dict(torch.load(sch_path))
+        else:
+            logger.warning("[init] No optimizer.pt — fast-forwarding LR schedule only")
+            for _ in range(start_step):
+                scheduler.step()
 
     # ── Training loop ────────────────────────────────────────────────────────
-    from rl.diversity_reward import compute_group_rewards
+    from rl.diversity_reward import compute_cold_rewards
 
     global_step = start_step
     last_metrics: dict = {}
-    if start_step >= cfg.total_steps:
-        logger.warning(f"[train] start_step {start_step} >= total_steps {cfg.total_steps}; nothing to do.")
+    if start_step >= total_steps:
+        logger.warning(f"[train] start_step {start_step} >= total_steps {total_steps}; nothing to do.")
         return model, tokenizer
     optimizer.zero_grad()
 
@@ -989,7 +1014,7 @@ def train(cfg: DiversityGRPOConfig):
     persistent_llm = None
     lora_slot_counter = start_step  # monotonically incrementing LoRA slot ID
 
-    while global_step < cfg.total_steps:
+    while global_step < total_steps:
         # SIGTERM received between steps — checkpoint completed work and yield node back.
         if _STOP_EVENT.is_set():
             logger.info("[train] SIGTERM — saving checkpoint and exiting cleanly")
@@ -1009,35 +1034,34 @@ def train(cfg: DiversityGRPOConfig):
                 max_new_tokens=cfg.max_new_tokens,
             )
 
-        # Sample batch of problems (without replacement within epoch)
-        batch = random.sample(problems, min(cfg.n_problems_per_step, len(problems)))
+        # Spec §1.4: λ grows per epoch (0 → 0.17 → 0.33 → 0.50)
+        current_epoch = global_step // steps_per_epoch + 1
+        step_lambda = _lambda_for_epoch(current_epoch)
 
-        # ── 1. Determine Phase and k for this step ───────────────────────────
-        # Phase 1 (steps 1..phase1_steps): k=1, pure quality, lambda=0.
-        # Phase 2 (steps phase1_steps+1..total_steps): k ~ Uniform{k_training_values}.
-        if global_step < cfg.phase1_steps:
-            step_k = 1
-        else:
-            step_k = random.choice(cfg.k_training_values)
-        step_lambda = lambda_fn(step_k, cfg.alpha_diversity, cfg.k_max_training)
+        # Sample batch — cycle through problems in epoch order
+        epoch_offset = global_step % steps_per_epoch
+        start_idx = epoch_offset * cfg.n_problems_per_step
+        batch = problems[start_idx : start_idx + cfg.n_problems_per_step]
+        if len(batch) < cfg.n_problems_per_step:
+            # Wrap around end of epoch
+            batch = batch + problems[: cfg.n_problems_per_step - len(batch)]
 
-        # ── 2. Build all rollout prompts ─────────────────────────────────────
-        # Always generate n_rollouts completions per problem for stable GRPO groups.
-        # Role indices cycle through 1..step_k when n_rollouts > step_k.
+        # ── 1. Build rollout prompts — one per attempt index i=1..I ──────────
+        # Spec §1.2: generate exactly I=16 rollouts per problem.
+        # Spec §1.1: attempt i=1 gets no prefix; i>1 gets [Attempt #i — use a new method].
         flat_prompts: list[str] = []
-        flat_meta: list[dict] = []   # {problem_idx, method_id, gold_answer}
+        flat_meta: list[dict] = []
 
         for pidx, prob in enumerate(batch):
-            for slot in range(cfg.n_rollouts):
-                role_i = (slot % step_k) + 1  # cycles 1..step_k
+            for i in range(1, cfg.n_rollouts + 1):   # i ∈ {1,...,16}
                 flat_prompts.append(
-                    build_chat_prompt(tokenizer, prob["problem"], role_i, step_k)
+                    build_chat_prompt(tokenizer, prob["problem"], i)
                 )
                 flat_meta.append({
                     "problem_idx": pidx,
-                    "method_id": role_i,
+                    "attempt_id":  i,
                     "gold_answer": prob["answer"],
-                    "problem_id": prob["id"],
+                    "problem_id":  prob.get("id", str(pidx)),
                 })
 
         # ---- 2. Generate rollouts with persistent vLLM (on-policy via LoRA) -----
@@ -1073,26 +1097,22 @@ def train(cfg: DiversityGRPOConfig):
             device=device, ref_batch_size=cfg.ref_batch_size,
         )
 
-        # ── 4. Compute rewards per group ─────────────────────────────────────
-        # Explicit no_grad: reward computation is purely scalar (numpy / API),
-        # but this guard ensures no gradient graph is ever accidentally built
-        # here — even if model-based step summarisation is added in future.
+        # ── 4. Compute rewards per group (spec §1.3–1.4) ─────────────────────
         flat_rewards: list[float] = []
         flat_correct: list[bool] = []
         group_div_scores: list[list[float]] = []
 
         with torch.no_grad():
             for pidx, prob in enumerate(batch):
-                # All rollouts for this problem
                 start = pidx * cfg.n_rollouts
-                group_comps = completions[start: start + cfg.n_rollouts]
-                rewards_g, correct_g, divs_g = compute_group_rewards(
+                group_comps = completions[start : start + cfg.n_rollouts]
+                rewards_g, correct_g, divs_g = compute_cold_rewards(
                     completions=group_comps,
                     gold_answer=prob["answer"],
                     benchmark=cfg.benchmark,
-                    lambda_div=step_lambda,
+                    lambda_eff=step_lambda,
                     embed_model=cfg.embed_model,
-                    use_xml_steps=cfg.use_xml_steps,
+                    I=cfg.n_rollouts,
                 )
                 flat_rewards.extend(rewards_g)
                 flat_correct.extend(correct_g)
@@ -1118,6 +1138,7 @@ def train(cfg: DiversityGRPOConfig):
             device=device,
             grad_accum=cfg.grad_accum,
             mini_batch=cfg.mini_batch,
+            total_tokens=0,   # 0 → auto-compute inside
         )
 
         if (global_step + 1) % cfg.grad_accum == 0:
@@ -1133,37 +1154,35 @@ def train(cfg: DiversityGRPOConfig):
         elapsed = time.time() - t0
         n_correct = sum(flat_correct)
         n_total = len(flat_correct)
-        pass_at_1 = np.mean(
-            [any(flat_correct[i * cfg.n_rollouts: (i + 1) * cfg.n_rollouts])
+        pass_at_1 = float(np.mean(
+            [any(flat_correct[i * cfg.n_rollouts : (i + 1) * cfg.n_rollouts])
              for i in range(len(batch))]
-        )
-        mean_div = np.mean([d for ds in group_div_scores for d in ds if d > 0] or [0.0])
+        ))
+        mean_div = float(np.mean(
+            [d for ds in group_div_scores for d in ds if d > 0] or [0.0]
+        ))
 
         metrics = {
-            "step": global_step,
-            "phase": 1 if global_step <= cfg.phase1_steps else 2,
-            "k": step_k,
-            "lambda": round(step_lambda, 4),
-            "loss": float(loss_val),
-            "n_correct": n_correct,
-            "n_total": n_total,
-            "pass_at_1_approx": float(pass_at_1),
-            "mean_diversity": float(mean_div),
-            "lr": float(scheduler.get_last_lr()[0]),
-            "elapsed_s": round(elapsed, 1),
+            "step":            global_step,
+            "epoch":           current_epoch,
+            "lambda":          round(step_lambda, 4),
+            "loss":            float(loss_val),
+            "n_correct":       n_correct,
+            "n_total":         n_total,
+            "pass_at_1_approx": pass_at_1,
+            "mean_diversity":  mean_div,
+            "lr":              float(scheduler.get_last_lr()[0]),
+            "elapsed_s":       round(elapsed, 1),
         }
 
         last_metrics = metrics
 
         if global_step % cfg.log_every == 0:
             logger.info(
-                f"[step {global_step:4d}/{cfg.total_steps}] "
-                f"loss={metrics['loss']:.4f}  "
-                f"correct={n_correct}/{n_total}  "
-                f"pass@1≈{pass_at_1:.2%}  "
-                f"div={mean_div:.4f}  "
-                f"lr={metrics['lr']:.2e}  "
-                f"({elapsed:.1f}s)"
+                f"[step {global_step:5d}/{total_steps}  epoch {current_epoch}/{cfg.n_epochs}] "
+                f"loss={metrics['loss']:.4f}  λ={step_lambda:.2f}  "
+                f"correct={n_correct}/{n_total}  pass@1≈{pass_at_1:.2%}  "
+                f"div={mean_div:.4f}  lr={metrics['lr']:.2e}  ({elapsed:.1f}s)"
             )
             with open(log_path, "a") as f:
                 f.write(json.dumps(metrics) + "\n")
@@ -1176,7 +1195,7 @@ def train(cfg: DiversityGRPOConfig):
 
             # Skip eval on SIGTERM — save time, get out quickly.
             if not _STOP_EVENT.is_set():
-                logger.info(f"[eval] Running COLD pass@16 eval at step {global_step}...")
+                logger.info(f"[eval] Quick pass@1 spot-check at step {global_step}")
                 lora_slot_counter += 1
                 try:
                     eval_metrics = eval_pass_at_k(
@@ -1194,13 +1213,8 @@ def train(cfg: DiversityGRPOConfig):
                     metrics.update(eval_metrics)
                     with open(ckpt_dir / "metrics.json", "w") as f:
                         json.dump({"step": global_step, **metrics}, f, indent=2)
-                    logger.info(
-                        f"[eval] pass@1={eval_metrics['pass@1']:.2%}  "
-                        f"pass@8={eval_metrics['pass@8']:.2%}  "
-                        f"pass@16={eval_metrics['pass@16']:.2%}"
-                    )
                 except Exception as e:
-                    logger.warning(f"[eval] pass@k eval failed (non-fatal): {e}")
+                    logger.warning(f"[eval] spot-check failed (non-fatal): {e}")
 
             if _STOP_EVENT.is_set():
                 logger.info("[train] SIGTERM — clean exit after mid-step checkpoint")

@@ -30,13 +30,12 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Must match rl/diversity_grpo.py exactly — the model is conditioned on these strings.
-# No system prompt: matches DARLING / DeepScaleR training format.
-PARALLEL_PREFIX = "[PARALLEL SAMPLE {i} OF {k}]"
+# Spec §1.1: must match training prefix exactly.
+# i=1 → no prefix; i>1 → "[Attempt #i — use a new method]"
+from rl.diversity_grpo import ATTEMPT_PREFIX, MATH_INSTRUCTION
 
-# Benchmark-specific answer instructions — same suffix used during training
 _ANSWER_INSTRUCTION = {
-    "default":        "Please reason step by step, and put your final answer within \\boxed{}.",
+    "default":        MATH_INSTRUCTION,
     "gpqa_diamond":   "Please reason step by step, then state your final answer as a single letter (A, B, C, or D) on the last line.",
     "livecodebench":  "Please reason step by step, then write your final answer as clean Python code.",
 }
@@ -46,12 +45,12 @@ def _answer_instruction(benchmark: str) -> str:
     return _ANSWER_INSTRUCTION.get(benchmark, _ANSWER_INSTRUCTION["default"])
 
 
-def _method_user_content(problem: str, i: int, k: int, benchmark: str) -> str:
-    """k>1: with prefix (COLD-RL mode). k=1: no prefix (standard mode). Mirrors training."""
+def _method_user_content(problem: str, i: int, benchmark: str) -> str:
+    """i=1: no prefix (standard mode). i>1: [Attempt #i — use a new method] prefix."""
     instruction = _answer_instruction(benchmark)
-    if k <= 1:
+    if i <= 1:
         return f"{problem}\n\n{instruction}"
-    prefix = PARALLEL_PREFIX.format(i=i, k=k)
+    prefix = ATTEMPT_PREFIX.format(i=i)
     return f"{prefix}\n\n{problem}\n\n{instruction}"
 
 
@@ -149,7 +148,7 @@ def eval_method_passk(
     for p in problems:
         for mid in range(1, max_k + 1):
             key = f"{p['id']}__m{mid}"
-            user_content = _method_user_content(p["problem"], i=mid, k=max_k, benchmark=benchmark)
+            user_content = _method_user_content(p["problem"], i=mid, benchmark=benchmark)
             prompts[key] = _no_system_chat(user_content)
 
     print(f"[method_eval] Running vLLM for {len(prompts)} prompts (n=1 each) ...", flush=True)

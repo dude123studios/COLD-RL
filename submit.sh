@@ -27,13 +27,16 @@
 #   MODEL=Qwen/Qwen2.5-7B OUTPUT_DIR=/path/to/dir sbatch submit.sh
 # ============================================================
 
-# ── Configurable parameters ──────────────────────────────────────────────────
+# ── Configurable parameters (override via env before sbatch) ─────────────────
 MODEL="${MODEL:-Qwen/Qwen2.5-7B}"
-DATASET="${DATASET:-deepscaler}"
+DATASET="${DATASET:-numinamath}"
 BENCHMARK="${BENCHMARK:-math}"
-TOTAL_STEPS="${TOTAL_STEPS:-8000}"
+N_EPOCHS="${N_EPOCHS:-8}"
+LR="${LR:-1e-5}"             # 1e-5 for 7B; 1e-4 for ≤3B
+EMBED_MODEL="${EMBED_MODEL:-local}"
 OUTPUT_DIR="${OUTPUT_DIR:-/data/user_data/shivansg/cold_rl_runs/cold_rl_main}"
 SEED="${SEED:-42}"
+GRPO_BASELINE="${GRPO_BASELINE:-}"   # set to "--grpo_baseline" for λ=0 runs
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo "[submit.sh] Job ${SLURM_JOB_ID} starting on $(hostname) at $(date)"
@@ -93,26 +96,25 @@ python3 -u -m rl.run_rl \
     --model         "${MODEL}" \
     --dataset       "${DATASET}" \
     --benchmark     "${BENCHMARK}" \
-    --n_rollouts    8 \
+    --n_rollouts    16 \
     --temperature   1.0 \
-    --total_steps   "${TOTAL_STEPS}" \
-    --n_problems_per_step 32 \
+    --n_epochs      "${N_EPOCHS}" \
+    --n_problems_per_step 16 \
     --mini_batch    8 \
     --ref_batch_size 4 \
-    --max_new_tokens 4096 \
-    --lr            2e-6 \
-    --kl_beta       0.04 \
-    --embed_model   local \
-    --lora_r        32 \
-    --lora_alpha    64 \
+    --max_new_tokens 8192 \
+    --lr            "${LR}" \
+    --kl_beta       0.01 \
+    --clip_eps      0.2 \
+    --embed_model   "${EMBED_MODEL}" \
+    --lora_r        64 \
+    --lora_alpha    128 \
     --log_every     10 \
     --save_every    50 \
-    --phase1_steps  4000 \
-    --alpha_diversity 0.3 \
-    --k_max_training 16 \
     --seed          "${SEED}" \
     --gpu_id        0 \
-    --output_dir    "${OUTPUT_DIR}" &
+    --output_dir    "${OUTPUT_DIR}" \
+    ${GRPO_BASELINE} &
 
 PYTHON_PID=$!
 echo "[submit.sh] Python training PID=${PYTHON_PID}"

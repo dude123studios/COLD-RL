@@ -1,37 +1,40 @@
 """
-Diversity reward computation for Diversity-GRPO.
+COLD-RL Diversity Reward
 
-Pipeline per rollout group (N traces for one problem):
-  1. Grade correctness (binary).
-  2. For each correct trace: extract steps into a list of text chunks.
-  3. Embed all steps with Qwen3-Embedding-8B via OpenRouter (or local fallback).
-  4. For trace i: diversity_score_i = max over all steps s in trace i,
-                                       max over all j≠i, all steps s' in trace j:
-                                       cosine_distance(s, s')
-     i.e. the single most "unique" step in trace i compared to all other traces.
-  5. Combined reward: r_i = r_correct_i + lambda_div * (r_correct_i * diversity_score_i)
-     (diversity is GATED by correctness)
+Spec (Section 1.3–1.4):
+
+  For attempt index i ∈ {1,...,I=16}, given a set of correct attempts
+  C = {i : v(x,y_i)=1}:
+
+    d_i = 1 − max_{j ∈ C, j < i} cos_sim_norm(e_i, e_j)
+
+      where e_i  = embedding of the reasoning trace BEFORE the final answer
+                   (last-layer pooling, no grad, frozen)
+            norm  = cosine sims are min-max normalized within the rollout group
+            d_i   = 0  if i==1, i∉C, |C|≤1, or no prior correct attempt exists
+
+    w_i = λ_eff · (i−1) / (I−1)          [linearly growing with attempt index]
+
+    r_i = v(x,y_i) · (1 + w_i · d_i)    [correctness-gated]
 """
 
-import os
 import re
-import time
-import hashlib
+import sys
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Answer extraction & correctness grading (reuse existing logic)
-# ---------------------------------------------------------------------------
-import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from generation.rollout import extract_answer
 
 
-def is_correct(response: str, gold_answer: str, benchmark: str = "gsm8k") -> bool:
+# ---------------------------------------------------------------------------
+# Correctness grading
+# ---------------------------------------------------------------------------
+
+def is_correct(response: str, gold_answer: str, benchmark: str = "math") -> bool:
     pred = extract_answer(response)
     gold_raw = str(gold_answer).strip()
     if benchmark == "aime24":
@@ -39,309 +42,245 @@ def is_correct(response: str, gold_answer: str, benchmark: str = "gsm8k") -> boo
             return int(pred.strip()) == int(gold_raw)
         except (ValueError, AttributeError):
             return pred.strip() == gold_raw
-    # Competition / HF math: gold may be plain or contain \\boxed{}
-    if benchmark in ("math", "deepscaler", "math500", "gsm8k"):
-        gold_norm = extract_answer(gold_raw) if "\\boxed" in gold_raw else gold_raw
-        return pred.strip() == gold_norm.strip()
-    return pred == gold_raw
+    gold_norm = extract_answer(gold_raw) if "\\boxed" in gold_raw else gold_raw
+    return pred.strip() == gold_norm.strip()
 
 
 # ---------------------------------------------------------------------------
-# Step extraction
+# Reasoning trace extraction
+# Spec: "embed strictly the reasoning trace (before the final answer line
+#        delimiter, e.g., \n\n)"
 # ---------------------------------------------------------------------------
 
-STEP_CACHE = Path(__file__).parent.parent / "results" / "rl_step_cache"
-
-
-def _split_steps_simple(text: str) -> list[str]:
-    """
-    Fast sentence-level step extraction (no extra model call).
-    Split on sentence boundaries, keeping only non-trivial chunks.
-    """
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-    steps = [s.strip() for s in sentences if len(s.strip()) > 20]
-    return steps if steps else [text[:500]]
-
-
-def _extract_steps_xml(response: str, model_name: str = None) -> list[str]:
-    """
-    Parse XML step tags if the model returned them.
-    Falls back to simple splitting if not found.
-    """
-    matches = re.findall(r"<step[^>]*>(.*?)</step>", response, re.DOTALL)
-    if matches:
-        return [m.strip() for m in matches if m.strip()]
-    return _split_steps_simple(response)
-
-
-def extract_steps(trace: str, use_xml: bool = False) -> list[str]:
-    """Extract steps from a trace. use_xml=True parses <step> tags."""
-    if use_xml:
-        return _extract_steps_xml(trace)
-    return _split_steps_simple(trace)
+def _extract_reasoning_trace(response: str) -> str:
+    """Drop the final answer paragraph/line, keep only the reasoning."""
+    # Try paragraph split: last paragraph is typically the boxed answer
+    parts = response.rsplit("\n\n", 1)
+    if len(parts) > 1 and "\\boxed" in parts[-1]:
+        return parts[0].strip()
+    # Fallback: drop last line containing \boxed
+    lines = response.split("\n")
+    for i in range(len(lines) - 1, -1, -1):
+        if "\\boxed" in lines[i] or "final answer" in lines[i].lower():
+            return "\n".join(lines[:i]).strip()
+    return response.strip()
 
 
 # ---------------------------------------------------------------------------
-# Embedding
+# Embedding backend
 # ---------------------------------------------------------------------------
 
-EMBED_CACHE = Path(__file__).parent.parent / "results" / "rl_embed_cache"
-EMBED_CACHE.mkdir(parents=True, exist_ok=True)
+_LOCAL_EMBED_MODEL = None
+_QWEN3_EMBED_BUNDLE = None  # (tokenizer, model)
 
 
-def _hash(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
+def _get_local_model():
+    global _LOCAL_EMBED_MODEL
+    if _LOCAL_EMBED_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+        _LOCAL_EMBED_MODEL = SentenceTransformer(
+            "intfloat/e5-small-v2", device="cpu"
+        )
+    return _LOCAL_EMBED_MODEL
 
 
-def embed_batch_openrouter(texts: list[str], model: str = "Qwen/Qwen3-Embedding-8B") -> np.ndarray:
-    """
-    Embed a list of texts using OpenRouter's embedding endpoint.
-    Returns shape (len(texts), embedding_dim), L2-normalized.
-    Uses per-text disk cache to avoid re-embedding on reruns.
-    """
+def _embed_local(traces: list[str]) -> np.ndarray:
+    mdl = _get_local_model()
+    embs = mdl.encode(
+        traces, normalize_embeddings=True,
+        batch_size=64, show_progress_bar=False,
+    )
+    return embs.astype(np.float32)
+
+
+def _embed_qwen3(traces: list[str]) -> np.ndarray:
+    """Spec requirement: Qwen3-Embedding, last-layer pooling, no gradients."""
+    global _QWEN3_EMBED_BUNDLE
+    import torch
+    from transformers import AutoTokenizer, AutoModel
+
+    if _QWEN3_EMBED_BUNDLE is None:
+        tok = AutoTokenizer.from_pretrained(
+            "Qwen/Qwen3-Embedding", trust_remote_code=True
+        )
+        mdl = AutoModel.from_pretrained(
+            "Qwen/Qwen3-Embedding",
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        mdl.eval()
+        _QWEN3_EMBED_BUNDLE = (tok, mdl)
+
+    tok, mdl = _QWEN3_EMBED_BUNDLE
+    device = next(mdl.parameters()).device
+    all_embs: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for start in range(0, len(traces), 16):
+            batch = traces[start : start + 16]
+            enc = tok(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            ).to(device)
+            hidden = mdl(**enc).last_hidden_state[:, 0, :]  # [CLS] pooling
+            hidden = hidden.float().cpu().numpy()
+            norms = np.linalg.norm(hidden, axis=1, keepdims=True) + 1e-8
+            all_embs.append(hidden / norms)
+
+    return np.concatenate(all_embs, axis=0).astype(np.float32)
+
+
+def _embed_openrouter(traces: list[str]) -> np.ndarray:
+    import os, time
     import openai
 
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
-        raise ValueError("OPENROUTER_API_KEY not set; use local embeddings instead (--embed_model local)")
-
+        raise ValueError(
+            "OPENROUTER_API_KEY not set; use --embed_model local or qwen3"
+        )
     client = openai.OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1", api_key=api_key
     )
-
-    # Per-text caching to avoid paying twice for the same step
-    embeddings = []
-    missing_idxs = []
-    missing_texts = []
-
-    for i, text in enumerate(texts):
-        cache_path = EMBED_CACHE / f"{_hash(text)}.npy"
-        if cache_path.exists():
-            embeddings.append(np.load(str(cache_path)))
-        else:
-            embeddings.append(None)
-            missing_idxs.append(i)
-            missing_texts.append(text)
-
-    if missing_texts:
-        # Batch in chunks of 256
-        CHUNK = 256
-        fetched = []
-        for start in range(0, len(missing_texts), CHUNK):
-            chunk = missing_texts[start:start + CHUNK]
-            for attempt in range(3):
-                try:
-                    resp = client.embeddings.create(input=chunk, model=model)
-                    fetched.extend([r.embedding for r in resp.data])
-                    break
-                except Exception as e:
-                    if attempt == 2:
-                        raise
-                    time.sleep(2 ** attempt)
-
-        for idx, emb_list in zip(missing_idxs, fetched):
-            emb = np.array(emb_list, dtype=np.float32)
-            # L2 normalise
-            norm = np.linalg.norm(emb)
-            if norm > 0:
-                emb /= norm
-            cache_path = EMBED_CACHE / f"{_hash(texts[idx])}.npy"
-            np.save(str(cache_path), emb)
-            embeddings[idx] = emb
-
-    return np.stack(embeddings)
+    all_embs: list[np.ndarray] = []
+    for start in range(0, len(traces), 256):
+        batch = traces[start : start + 256]
+        for attempt in range(3):
+            try:
+                resp = client.embeddings.create(
+                    input=batch, model="Qwen/Qwen3-Embedding-8B"
+                )
+                embs = np.array([r.embedding for r in resp.data], dtype=np.float32)
+                norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-8
+                all_embs.append(embs / norms)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
+    return np.concatenate(all_embs, axis=0)
 
 
-_LOCAL_EMBED_MODEL = None
-
-
-def _get_local_embed_model():
-    """Lazy singleton: load SentenceTransformer once and reuse across all calls."""
-    global _LOCAL_EMBED_MODEL
-    if _LOCAL_EMBED_MODEL is None:
-        from sentence_transformers import SentenceTransformer
-        _LOCAL_EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
-    return _LOCAL_EMBED_MODEL
-
-
-def embed_batch_local(texts: list[str]) -> np.ndarray:
-    """Local embedding fallback using sentence-transformers (singleton model)."""
-    model = _get_local_embed_model()
-    embs = model.encode(texts, normalize_embeddings=True, batch_size=64, show_progress_bar=False)
-    return embs.astype(np.float32)
-
-
-def embed_steps(steps: list[str], embed_model: str = "openrouter") -> np.ndarray:
+def embed_traces(traces: list[str], embed_model: str = "local") -> np.ndarray:
     """
-    Embed a list of step strings.
-    embed_model: "openrouter" (Qwen3-Embedding-8B) | "local" (MiniLM)
+    Embed reasoning traces. Returns (N, d) L2-normalized float32 array.
+
+    embed_model options:
+      "local"      — intfloat/e5-small-v2 on CPU  (fast, no extra GPU needed)
+      "qwen3"      — Qwen/Qwen3-Embedding on GPU   (spec requirement)
+      "openrouter" — Qwen3-Embedding-8B via API    (requires OPENROUTER_API_KEY)
     """
-    if not steps:
+    if not traces:
         return np.zeros((0, 384), dtype=np.float32)
     if embed_model == "local":
-        return embed_batch_local(steps)
-    # OpenRouter Qwen3-Embedding-8B
-    return embed_batch_openrouter(steps, model="Qwen/Qwen3-Embedding-8B")
+        return _embed_local(traces)
+    if embed_model == "qwen3":
+        return _embed_qwen3(traces)
+    if embed_model == "openrouter":
+        return _embed_openrouter(traces)
+    raise ValueError(f"Unknown embed_model: {embed_model!r}")
 
 
 # ---------------------------------------------------------------------------
-# Diversity score computation
+# Core COLD-RL reward
 # ---------------------------------------------------------------------------
 
-def compute_diversity_scores(
-    step_embeddings: list[Optional[np.ndarray]],
-) -> list[float]:
+def compute_cold_rewards(
+    completions: list[str],
+    gold_answer: str,
+    benchmark: str = "math",
+    lambda_eff: float = 0.5,
+    embed_model: str = "local",
+    I: int = 16,
+) -> tuple[list[float], list[bool], list[float]]:
     """
-    For each trace i with step embeddings matrix E_i (shape [n_steps_i, d]):
+    Compute r_i for each attempt i ∈ {1,...,I}.
 
-      diversity_score_i = max over steps s in E_i of:
-                            min over j≠i, all steps s' in E_j:
-                              cosine_distance(s, s')
-
-    This is the "most isolated step" formulation:
-      - For each step s in trace i, compute its nearest-neighbor cosine distance
-        to any step across all other traces (how isolated is this step?).
-      - The diversity score is the maximum such nearest-neighbor distance —
-        i.e., the single most unique step in trace i gets the score.
-
-    Traces that introduce at least one step that is far from any step in all
-    other rollouts receive a high diversity reward.
-
-    Args:
-        step_embeddings: list of N elements. Each is either:
-            - None  (incorrect trace, no diversity reward)
-            - np.ndarray of shape (n_steps, embed_dim), L2-normalised
-    Returns:
-        list[float] diversity scores, 0.0 for incorrect traces.
+    Returns
+    -------
+    rewards  : r_i = v_i · (1 + w_i · d_i)
+    correct  : bool per attempt
+    d_scores : raw d_i values (0 for non-contributing attempts)
     """
-    n = len(step_embeddings)
-    scores = []
+    assert len(completions) == I, (
+        f"Expected exactly {I} completions, got {len(completions)}"
+    )
 
-    for i in range(n):
-        if step_embeddings[i] is None or len(step_embeddings[i]) == 0:
-            scores.append(0.0)
-            continue
+    # 1. Grade correctness; build 1-indexed correct set C
+    correct = [is_correct(c, gold_answer, benchmark) for c in completions]
+    C = {i + 1 for i, ok in enumerate(correct) if ok}
 
-        E_i = step_embeddings[i]  # (n_steps_i, d)
+    # 2. Per-attempt weights w_i = λ · (i-1)/(I-1)
+    weights = [
+        lambda_eff * (i - 1) / (I - 1) if I > 1 else 0.0
+        for i in range(1, I + 1)
+    ]
 
-        # Collect all step embeddings from other traces
-        other_embs = []
-        for j in range(n):
-            if j == i or step_embeddings[j] is None or len(step_embeddings[j]) == 0:
+    # 3. d_i — only meaningful when ≥2 correct attempts exist and λ>0
+    d_scores = [0.0] * I
+
+    if len(C) >= 2 and lambda_eff > 0.0:
+        # Extract reasoning traces (no final-answer paragraph)
+        traces = [_extract_reasoning_trace(c) for c in completions]
+        embs = embed_traces(traces, embed_model)  # (I, dim)
+
+        # Cosine similarity matrix (embeddings are L2-normalized, so dot = cos_sim)
+        sim_matrix = (embs @ embs.T).astype(np.float64)  # (I, I)
+
+        # Min-max normalize within the rollout group using off-diagonal elements
+        mask = ~np.eye(I, dtype=bool)
+        off_diag = sim_matrix[mask]
+        s_min, s_max = float(off_diag.min()), float(off_diag.max())
+        if s_max > s_min:
+            sim_norm = np.clip(
+                (sim_matrix - s_min) / (s_max - s_min), 0.0, 1.0
+            )
+        else:
+            sim_norm = np.clip(sim_matrix, 0.0, 1.0)
+
+        for i in range(1, I + 1):          # 1-indexed attempt number
+            idx = i - 1
+            # Zero out per spec
+            if i == 1 or (i not in C) or len(C) == 1:
                 continue
-            other_embs.append(step_embeddings[j])
+            prior_correct = [j for j in C if j < i]
+            if not prior_correct:
+                continue
+            sims = [sim_norm[idx, j - 1] for j in prior_correct]
+            d_scores[idx] = float(1.0 - max(sims))
 
-        if not other_embs:
-            scores.append(0.0)
-            continue
+    # 4. r_i = v_i · (1 + w_i · d_i)
+    rewards = [
+        float(correct[i]) * (1.0 + weights[i] * d_scores[i])
+        for i in range(I)
+    ]
 
-        E_others = np.concatenate(other_embs, axis=0)  # (total_other_steps, d)
-
-        # For each step s in trace i: nearest-neighbor cosine distance across E_others
-        # sim matrix: (n_steps_i, total_other_steps)
-        sim_matrix = E_i @ E_others.T         # cosine similarities (normalised)
-        dist_matrix = 1.0 - sim_matrix        # cosine distances ∈ [0, 2]
-
-        # Nearest-neighbor distance for each step in trace i
-        nn_dists = dist_matrix.min(axis=1)    # (n_steps_i,)
-
-        # Most isolated step: the step with the highest nearest-neighbor distance
-        diversity_score_i = float(nn_dists.max())
-        scores.append(diversity_score_i)
-
-    return scores
+    return rewards, correct, d_scores
 
 
 # ---------------------------------------------------------------------------
-# Full group reward computation
+# Kept for backward compat with any code that still imports compute_group_rewards
 # ---------------------------------------------------------------------------
-
-_APPROACH_FRAMING_RE = re.compile(
-    r"^[\s\S]*?(?:approach|method|solution|strategy|technique|algebraic|geometric"
-    r"|arithmetic|number.theoretic|combinatorial|direct|indirect)[^\n]*[\n.!?]+",
-    re.IGNORECASE,
-)
-
-
-def _strip_approach_framing(text: str) -> str:
-    """
-    Remove any opening sentence that merely re-states the approach label
-    (e.g. "Using an algebraic approach, ..." or "Method 3: ...").
-    This prevents the model from gaming diversity by varying only the framing
-    words while producing identical mathematics.
-    """
-    # Only strip a single leading sentence (≤ 200 chars); if longer, leave untouched.
-    m = _APPROACH_FRAMING_RE.match(text)
-    if m and m.end() < 200:
-        return text[m.end():].strip()
-    return text
-
 
 def compute_group_rewards(
     completions: list[str],
     gold_answer: str,
-    benchmark: str = "gsm8k",
+    benchmark: str = "math",
     lambda_div: float = 0.5,
-    embed_model: str = "openrouter",
-    use_xml_steps: bool = False,
+    embed_model: str = "local",
+    use_xml_steps: bool = False,  # ignored — spec uses trace-level, not step-level
 ) -> tuple[list[float], list[bool], list[float]]:
-    """
-    Compute combined rewards for all N completions of one problem.
-
-    Reward hacking prevention:
-      - Diversity is computed ONLY on the mathematical content of each step,
-        after stripping any opening sentence that merely re-states the
-        approach label (e.g. "Using an algebraic approach...").  This prevents
-        the model from earning diversity reward by varying framing language
-        while producing identical mathematics.
-      - Diversity is gated on correctness: incorrect traces get 0 diversity reward.
-      - All values are plain floats / numpy arrays — no PyTorch computation graph
-        is involved here, so no gradients can leak back through the reward signal.
-
-    Returns:
-        rewards      : combined reward (correctness + gated diversity)
-        correct_mask : bool per completion
-        div_scores   : raw diversity score per completion (0 if incorrect)
-    """
-    correct_mask = [is_correct(c, gold_answer, benchmark) for c in completions]
-
-    # Only compute diversity for correct traces
-    all_steps: list[Optional[list[str]]] = []
-    all_flat_steps: list[str] = []
-    step_slices: list[Optional[tuple[int, int]]] = []
-
-    offset = 0
-    for i, (comp, ok) in enumerate(zip(completions, correct_mask)):
-        if ok:
-            # Strip framing before step extraction to prevent surface-level gaming
-            content = _strip_approach_framing(comp)
-            steps = extract_steps(content, use_xml=use_xml_steps)
-            all_steps.append(steps)
-            step_slices.append((offset, offset + len(steps)))
-            all_flat_steps.extend(steps)
-            offset += len(steps)
-        else:
-            all_steps.append(None)
-            step_slices.append(None)
-
-    # Embed all steps in one batch
-    step_embs_by_trace: list[Optional[np.ndarray]] = []
-    if all_flat_steps:
-        flat_embs = embed_steps(all_flat_steps, embed_model=embed_model)
-        for i, slc in enumerate(step_slices):
-            if slc is not None:
-                step_embs_by_trace.append(flat_embs[slc[0]:slc[1]])
-            else:
-                step_embs_by_trace.append(None)
-    else:
-        step_embs_by_trace = [None] * len(completions)
-
-    div_scores = compute_diversity_scores(step_embs_by_trace)
-
-    rewards = [
-        float(ok) + lambda_div * float(ok) * d
-        for ok, d in zip(correct_mask, div_scores)
-    ]
-
-    return rewards, correct_mask, div_scores
+    """Thin shim so old call-sites don't break during transition."""
+    I = len(completions)
+    return compute_cold_rewards(
+        completions=completions,
+        gold_answer=gold_answer,
+        benchmark=benchmark,
+        lambda_eff=lambda_div,
+        embed_model=embed_model,
+        I=I,
+    )
