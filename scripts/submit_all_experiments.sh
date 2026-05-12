@@ -26,24 +26,95 @@ SUBMIT_LOG="${SLOG}/submit_$(date +%Y%m%d_%H%M%S).log"
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "${SUBMIT_LOG}"; }
 
 CONDA_INIT="source /home/shivansg/miniconda/etc/profile.d/conda.sh && conda activate env"
-HF_EXPORTS="export HF_HOME=/data/user_data/shivansg/.hf_cache HF_HUB_CACHE=/data/hf_cache/hub HF_DATASETS_CACHE=/data/hf_cache/datasets HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false"
+HF_EXPORTS="export HF_HOME=/data/user_data/shivansg/.hf_cache HF_DATASETS_CACHE=/data/user_data/shivansg/.hf_cache/datasets HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false TRITON_CACHE_DIR=/data/user_data/shivansg/triton_cache"
+
+# ---------------------------------------------------------------------------
+# submit_setup: download all models + datasets to /data HF cache
+# ---------------------------------------------------------------------------
+submit_setup() {
+    sbatch --parsable \
+        --job-name="cold-setup" \
+        --partition=general \
+        --cpus-per-task=8 \
+        --mem=32G \
+        --time=12:00:00 \
+        --output="${SLOG}/cold-setup-%j.out" \
+        --error="${SLOG}/cold-setup-%j.err" \
+        --wrap="
+set -e
+${CONDA_INIT}
+export HF_HOME=/data/user_data/shivansg/.hf_cache
+export HF_DATASETS_CACHE=/data/user_data/shivansg/.hf_cache/datasets
+export TOKENIZERS_PARALLELISM=false
+mkdir -p \${HF_HOME}
+cd ${REPO_DIR}
+echo '[setup] Downloading models and datasets to /data HF cache...'
+python3 - <<'PYEOF'
+import os, sys
+os.environ.setdefault('HF_HOME', '/data/user_data/shivansg/.hf_cache')
+os.environ.setdefault('HF_DATASETS_CACHE', '/data/user_data/shivansg/.hf_cache/datasets')
+from huggingface_hub import snapshot_download
+from datasets import load_dataset
+
+models = [
+    'Qwen/Qwen2.5-7B',
+    'Qwen/Qwen2.5-3B',
+    'Qwen/Qwen2.5-1.5B',
+    'Qwen/Qwen2.5-0.5B',
+    'Qwen/Qwen2.5-7B-Instruct',
+    'intfloat/e5-small-v2',
+]
+for m in models:
+    print(f'[setup] Downloading model {m} ...', flush=True)
+    snapshot_download(m)
+    print(f'[setup]   Done: {m}', flush=True)
+
+datasets_list = [
+    ('AI-MO/NuminaMath-CoT', 'train', None),
+    ('open-thoughts/OpenThoughts-3', 'train', None),
+    ('qwedsacf/competition_math', 'train', None),
+    ('lighteval/MATH', 'train', None),
+    ('lighteval/MATH', 'test', None),
+]
+for name, split, cfg in datasets_list:
+    print(f'[setup] Downloading dataset {name}:{split} ...', flush=True)
+    kw = {'split': split}
+    if cfg:
+        kw['name'] = cfg
+    try:
+        load_dataset(name, **kw)
+        print(f'[setup]   Done: {name}:{split}', flush=True)
+    except Exception as e:
+        print(f'[setup]   ERROR {name}:{split}: {e}', flush=True)
+        sys.exit(1)
+print('[setup] All downloads complete.', flush=True)
+PYEOF
+echo '[setup] Running benchmark download...'
+python3 -m scripts.download_benchmarks
+echo '[setup] Setup complete.'
+"
+}
 
 # ---------------------------------------------------------------------------
 # submit_train: submit a training job, echo back the SLURM job ID
 # ---------------------------------------------------------------------------
 submit_train() {
-    local name="$1" model="$2" lr="$3"
-    shift 3
+    local name="$1" model="$2" lr="$3" dep_jid="$4"
+    shift 4
     local extra_env="${*:-}"   # optional "KEY=VALUE ..." to append to --export
 
     local export_str="ALL,REPO_DIR=${REPO_DIR},MODEL=${model},LR=${lr},OUTPUT_DIR=${BASE_DIR}/${name}"
     [[ -n "${extra_env}" ]] && export_str="${export_str},${extra_env}"
+
+    local dep_flag=""
+    [[ -n "${dep_jid}" ]] && dep_flag="--dependency=afterok:${dep_jid}"
 
     sbatch --parsable \
         --job-name="cold-${name}" \
         --export="${export_str}" \
         --output="${SLOG}/cold-${name}-%j.out" \
         --error="${SLOG}/cold-${name}-%j.err" \
+        ${dep_flag} \
         "${REPO_DIR}/submit.sh"
 }
 
@@ -148,20 +219,27 @@ python3 -m evaluation.water_filling \
 }
 
 # ===========================================================================
+# Setup — download all models and datasets before any training starts
+# ===========================================================================
+log "=== Setup: downloading models + datasets ==="
+JID_SETUP=$(submit_setup)
+log "  setup → job ${JID_SETUP}"
+
+# ===========================================================================
 # E1 — Main pass@k sweep: Qwen2.5-Base 0.5B / 1.5B / 3B / 7B
 # ===========================================================================
 log "=== E1: Main pass@k sweep ==="
 
-JID_E1_7B=$(submit_train   "e1_7b"    "Qwen/Qwen2.5-7B"    "1e-5")
+JID_E1_7B=$(submit_train   "e1_7b"    "Qwen/Qwen2.5-7B"    "1e-5"  "${JID_SETUP}")
 log "  E1 7B   → job ${JID_E1_7B}"
 
-JID_E1_3B=$(submit_train   "e1_3b"    "Qwen/Qwen2.5-3B"    "1e-4")
+JID_E1_3B=$(submit_train   "e1_3b"    "Qwen/Qwen2.5-3B"    "1e-4"  "${JID_SETUP}")
 log "  E1 3B   → job ${JID_E1_3B}"
 
-JID_E1_1P5B=$(submit_train "e1_1p5b"  "Qwen/Qwen2.5-1.5B"  "1e-4")
+JID_E1_1P5B=$(submit_train "e1_1p5b"  "Qwen/Qwen2.5-1.5B"  "1e-4"  "${JID_SETUP}")
 log "  E1 1.5B → job ${JID_E1_1P5B}"
 
-JID_E1_0P5B=$(submit_train "e1_0p5b"  "Qwen/Qwen2.5-0.5B"  "1e-4")
+JID_E1_0P5B=$(submit_train "e1_0p5b"  "Qwen/Qwen2.5-0.5B"  "1e-4"  "${JID_SETUP}")
 log "  E1 0.5B → job ${JID_E1_0P5B}"
 
 # Eval jobs (afterok on training; eval uses the output_dir as lora_dir — run_rl.py
@@ -183,7 +261,7 @@ log "  eval 0.5B → job ${JID_EVAL_0P5B}"
 # ===========================================================================
 log "=== GRPO baseline (λ=0) ==="
 
-JID_GRPO_7B=$(submit_train "grpo_baseline_7b" "Qwen/Qwen2.5-7B" "1e-5" \
+JID_GRPO_7B=$(submit_train "grpo_baseline_7b" "Qwen/Qwen2.5-7B" "1e-5" "${JID_SETUP}" \
     "GRPO_BASELINE=--grpo_baseline")
 log "  GRPO 7B → job ${JID_GRPO_7B}"
 
@@ -196,7 +274,7 @@ log "  eval GRPO 7B → job ${JID_EVAL_GRPO}"
 # ===========================================================================
 log "=== E2: Long-CoT benchmark ==="
 
-JID_E2=$(submit_train "e2_longcot_7b" "Qwen/Qwen2.5-7B-Instruct" "1e-5" \
+JID_E2=$(submit_train "e2_longcot_7b" "Qwen/Qwen2.5-7B-Instruct" "1e-5" "${JID_SETUP}" \
     "DATASET=openthoughts3")
 log "  E2 7B-Instruct → job ${JID_E2}"
 
@@ -269,6 +347,8 @@ log ""
 log "══════════════════════════════════════════════"
 log "Submission complete. All jobs queued."
 log "══════════════════════════════════════════════"
+log "Setup (must finish before training starts):"
+log "  setup          ${JID_SETUP}"
 log "Training:"
 log "  e1_7b          ${JID_E1_7B}"
 log "  e1_3b          ${JID_E1_3B}"

@@ -938,22 +938,6 @@ def train(cfg: DiversityGRPOConfig):
         weight_decay=0.0,
     )
 
-    if cfg.resume_from:
-        resume_path = Path(cfg.resume_from).resolve()
-        opt_path = resume_path / "optimizer.pt"
-        sch_path = resume_path / "scheduler.pt"
-        if opt_path.exists() and sch_path.exists():
-            logger.info(f"[init] Restoring optimizer + scheduler state from {resume_path}")
-            optimizer.load_state_dict(torch.load(opt_path, map_location="cpu"))
-            scheduler.load_state_dict(torch.load(sch_path))
-        else:
-            # Checkpoint predates optimizer-state saving — fast-forward LR curve only
-            logger.warning("[init] No optimizer.pt found — fast-forwarding LR schedule only")
-            for _ in range(start_step):
-                scheduler.step()
-    else:
-        pass  # fresh run; scheduler starts at step 0
-
     # ── Data ─────────────────────────────────────────────────────────────────
     problems = load_problems(cfg.dataset, cfg.dataset_path)
     random.shuffle(problems)

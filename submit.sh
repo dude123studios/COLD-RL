@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=cold-rl-train
 #SBATCH --partition=preempt
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=100G
 #SBATCH --time=12:00:00
@@ -48,15 +48,13 @@ source /home/shivansg/miniconda/etc/profile.d/conda.sh
 conda activate env
 
 export PYTORCH_ALLOC_CONF=expandable_segments:True
-# Training uses GPU 0; GPU 1 is reserved for vLLM colocated rollouts if needed.
-# The run_rl.py script respects CUDA_VISIBLE_DEVICES when set.
-export CUDA_VISIBLE_DEVICES=0,1
 
 export HF_HOME=/data/user_data/shivansg/.hf_cache
-export HF_HUB_CACHE=/data/hf_cache/hub
-export HF_DATASETS_CACHE=/data/hf_cache/datasets
+export HF_DATASETS_CACHE=/data/user_data/shivansg/.hf_cache/datasets
 export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
+# Write triton autotune cache to /data to avoid NFS-related hangs on job exit.
+export TRITON_CACHE_DIR=/data/user_data/shivansg/triton_cache
 
 mkdir -p "${OUTPUT_DIR}"
 
