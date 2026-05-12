@@ -45,7 +45,7 @@ echo "[submit.sh] Output dir: ${OUTPUT_DIR}"
 
 # ── Environment ──────────────────────────────────────────────────────────────
 source /home/shivansg/miniconda/etc/profile.d/conda.sh
-conda activate cold-rl          # adjust to your env name
+conda activate env
 
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 # Training uses GPU 0; GPU 1 is reserved for vLLM colocated rollouts if needed.

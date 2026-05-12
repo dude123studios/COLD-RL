@@ -2,123 +2,110 @@
 # ============================================================
 # COLD-RL full experiment chain — E1 through E5 + baselines
 #
-# Submits all training jobs to the preempt partition.
-# Each eval job depends (afterok) on its training job completing.
-# Cross-experiment eval (E3/E4/E5) depends on the 7B training job.
+# Design notes:
+#   - BASE_DIR is on /data (compute nodes only). Login node never
+#     mkdir's there — each job creates its own subdirs on startup.
+#   - SLURM --output goes to HOME (NFS, writable everywhere).
+#   - Eval/calib jobs are chained with afterok on training jobs.
+#   - Water-filling is CPU-only → general partition.
 #
 # Usage:
 #   bash scripts/submit_all_experiments.sh
-#
-# Monitor:
-#   squeue -u $USER
-#   tail -f /data/user_data/shivansg/cold_rl_runs/logs/submit.log
 # ============================================================
 
 set -euo pipefail
 
 BASE_DIR="/data/user_data/shivansg/cold_rl_runs"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# SLURM job stdout/stderr goes here — compute nodes write to /data; login node writes submit log to /home
-SLURM_LOG_DIR="${BASE_DIR}/logs"           # created by first compute job
-LOCAL_LOG_DIR="${HOME}/cold_rl_submit_logs" # login-node writable
-mkdir -p "${LOCAL_LOG_DIR}"
-SUBMIT_LOG="${LOCAL_LOG_DIR}/submit.log"
-LOG_DIR="${SLURM_LOG_DIR}"   # used in sbatch --output lines (compute nodes create it)
+
+# Login-node writable dir for sbatch stdout/stderr and this script's log
+SLOG="${HOME}/cold_rl_submit_logs"
+mkdir -p "${SLOG}"
+SUBMIT_LOG="${SLOG}/submit_$(date +%Y%m%d_%H%M%S).log"
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "${SUBMIT_LOG}"; }
 
+CONDA_INIT="source /home/shivansg/miniconda/etc/profile.d/conda.sh && conda activate env"
+HF_EXPORTS="export HF_HOME=/data/user_data/shivansg/.hf_cache HF_HUB_CACHE=/data/hf_cache/hub HF_DATASETS_CACHE=/data/hf_cache/datasets HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false"
+
 # ---------------------------------------------------------------------------
-# Helper: submit one training job, return its SLURM job ID
+# submit_train: submit a training job, echo back the SLURM job ID
 # ---------------------------------------------------------------------------
 submit_train() {
     local name="$1" model="$2" lr="$3"
     shift 3
-    local extra_env=("$@")   # KEY=VALUE pairs to export
+    local extra_env="${*:-}"   # optional "KEY=VALUE ..." to append to --export
 
-    local out_dir="${BASE_DIR}/${name}"
-    # out_dir is on /data — created by the compute job itself via submit.sh
+    local export_str="ALL,MODEL=${model},LR=${lr},OUTPUT_DIR=${BASE_DIR}/${name}"
+    [[ -n "${extra_env}" ]] && export_str="${export_str},${extra_env}"
 
-    # Build export string
-    local exports="ALL,MODEL=${model},LR=${lr},OUTPUT_DIR=${out_dir}"
-    for kv in "${extra_env[@]:-}"; do
-        [[ -n "${kv}" ]] && exports="${exports},${kv}"
-    done
-
-    local jid
-    jid=$(sbatch --parsable \
+    sbatch --parsable \
         --job-name="cold-${name}" \
-        --export="${exports}" \
-        "${REPO_DIR}/submit.sh")
-    log "  submitted ${name} → job ${jid}"
-    echo "${jid}"
+        --export="${export_str}" \
+        --output="${SLOG}/cold-${name}-%j.out" \
+        --error="${SLOG}/cold-${name}-%j.err" \
+        "${REPO_DIR}/submit.sh"
 }
 
 # ---------------------------------------------------------------------------
-# Helper: submit evaluation job depending on a training job
+# submit_eval: GPU eval job depending on a training job
 # ---------------------------------------------------------------------------
 submit_eval() {
-    local name="$1" dep_jid="$2" model="$3" lora_dir="$4" benchmark="$5"
-    shift 5
-    local extra_k="${1:-64}"   # max-k
+    local name="$1" dep_jid="$2" model="$3" lora_dir="$4" benchmark="$5" maxk="${6:-64}"
 
-    local out="${BASE_DIR}/eval/${name}.json"
-    mkdir -p "${BASE_DIR}/eval"
+    local out_json="${BASE_DIR}/eval/${name}.json"
 
-    local jid
-    jid=$(sbatch --parsable \
+    sbatch --parsable \
         --job-name="eval-${name}" \
         --partition=preempt \
         --gres=gpu:1 \
         --cpus-per-task=8 \
         --mem=60G \
         --time=4:00:00 \
-        --output="${LOG_DIR}/eval-${name}-%j.out" \
+        --requeue \
+        --output="${SLOG}/eval-${name}-%j.out" \
         --dependency="afterok:${dep_jid}" \
         --wrap="
-source /home/shivansg/miniconda/etc/profile.d/conda.sh
-conda activate cold-rl
-export HF_HOME=/data/user_data/shivansg/.hf_cache
-export HF_HUB_CACHE=/data/hf_cache/hub
-export HF_DATASETS_CACHE=/data/hf_cache/datasets
-export HF_HUB_OFFLINE=1
+set -e
+${CONDA_INIT}
+${HF_EXPORTS}
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+mkdir -p ${BASE_DIR}/eval
 cd ${REPO_DIR}
 python3 -m evaluation.passk_method_eval \
     --model ${model} \
     --lora-path ${lora_dir} \
     --benchmarks ${benchmark} \
-    --max-k ${extra_k} \
+    --max-k ${maxk} \
     --experiment-id ${name} \
-    --out ${out}
-")
-    log "  submitted eval-${name} → job ${jid} (dep: ${dep_jid})"
-    echo "${jid}"
+    --out ${out_json}
+"
 }
 
 # ---------------------------------------------------------------------------
-# Helper: submit calibration job
+# submit_calib: calibration job (spec §2.1: 500 problems × 64 draws × 16 indices)
 # ---------------------------------------------------------------------------
 submit_calib() {
     local name="$1" dep_jid="$2" model="$3" lora_dir="$4" benchmark="$5"
 
-    local out="${BASE_DIR}/calibration/${name}.json"
-    mkdir -p "${BASE_DIR}/calibration"
+    local out_json="${BASE_DIR}/calibration/${name}.json"
 
-    local jid
-    jid=$(sbatch --parsable \
+    sbatch --parsable \
         --job-name="calib-${name}" \
         --partition=preempt \
         --gres=gpu:1 \
         --cpus-per-task=8 \
         --mem=60G \
-        --time=8:00:00 \
-        --output="${LOG_DIR}/calib-${name}-%j.out" \
+        --time=12:00:00 \
+        --requeue \
+        --output="${SLOG}/calib-${name}-%j.out" \
         --dependency="afterok:${dep_jid}" \
         --wrap="
-source /home/shivansg/miniconda/etc/profile.d/conda.sh
-conda activate cold-rl
-export HF_HOME=/data/user_data/shivansg/.hf_cache
-export HF_HUB_CACHE=/data/hf_cache/hub
-export HF_HUB_OFFLINE=1
+set -e
+${CONDA_INIT}
+${HF_EXPORTS}
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+mkdir -p ${BASE_DIR}/calibration
 cd ${REPO_DIR}
 python3 -m evaluation.calibration \
     --model ${model} \
@@ -128,156 +115,166 @@ python3 -m evaluation.calibration \
     --R 64 \
     --n-max 128 \
     --dataset math500 \
-    --out ${out}
-")
-    log "  submitted calib-${name} → job ${jid} (dep: ${dep_jid})"
-    echo "${jid}"
+    --out ${out_json}
+"
 }
 
 # ---------------------------------------------------------------------------
-# Helper: submit water-filling job depending on calibration
+# submit_wf: CPU-only water-filling job depending on calibration
 # ---------------------------------------------------------------------------
 submit_wf() {
     local name="$1" dep_jid="$2" calib_json="$3"
 
-    local out="${BASE_DIR}/water_filling/${name}.json"
-    mkdir -p "${BASE_DIR}/water_filling"
+    local out_json="${BASE_DIR}/water_filling/${name}.json"
 
-    local jid
-    jid=$(sbatch --parsable \
+    sbatch --parsable \
         --job-name="wf-${name}" \
-        --partition=preempt \
-        --gres=gpu:0 \
+        --partition=cpu \
         --cpus-per-task=4 \
         --mem=16G \
         --time=0:30:00 \
-        --output="${LOG_DIR}/wf-${name}-%j.out" \
+        --output="${SLOG}/wf-${name}-%j.out" \
         --dependency="afterok:${dep_jid}" \
         --wrap="
-source /home/shivansg/miniconda/etc/profile.d/conda.sh
-conda activate cold-rl
+set -e
+${CONDA_INIT}
+mkdir -p ${BASE_DIR}/water_filling
 cd ${REPO_DIR}
 python3 -m evaluation.water_filling \
     --calib ${calib_json} \
     --k-values 1 2 4 8 16 32 64 128 256 512 \
-    --out ${out}
-")
-    log "  submitted wf-${name} → job ${jid} (dep: ${dep_jid})"
-    echo "${jid}"
+    --out ${out_json}
+"
 }
 
 # ===========================================================================
-# E1 — Main pass@k sweep (Qwen2.5-Base: 0.5B, 1.5B, 3B, 7B)
+# E1 — Main pass@k sweep: Qwen2.5-Base 0.5B / 1.5B / 3B / 7B
 # ===========================================================================
 log "=== E1: Main pass@k sweep ==="
 
 JID_E1_7B=$(submit_train   "e1_7b"    "Qwen/Qwen2.5-7B"    "1e-5")
+log "  E1 7B   → job ${JID_E1_7B}"
+
 JID_E1_3B=$(submit_train   "e1_3b"    "Qwen/Qwen2.5-3B"    "1e-4")
+log "  E1 3B   → job ${JID_E1_3B}"
+
 JID_E1_1P5B=$(submit_train "e1_1p5b"  "Qwen/Qwen2.5-1.5B"  "1e-4")
+log "  E1 1.5B → job ${JID_E1_1P5B}"
+
 JID_E1_0P5B=$(submit_train "e1_0p5b"  "Qwen/Qwen2.5-0.5B"  "1e-4")
+log "  E1 0.5B → job ${JID_E1_0P5B}"
 
-# Find final checkpoint dir after training (highest step_XXXXX)
-LORA_7B="${BASE_DIR}/e1_7b"
-LORA_3B="${BASE_DIR}/e1_3b"
-LORA_1P5B="${BASE_DIR}/e1_1p5b"
-LORA_0P5B="${BASE_DIR}/e1_0p5b"
+# Eval jobs (afterok on training; eval uses the output_dir as lora_dir — run_rl.py
+# saves step_XXXXX/ inside it; passk_method_eval will use the highest-step checkpoint)
+JID_EVAL_7B=$(submit_eval   "e1_7b"    "${JID_E1_7B}"    "Qwen/Qwen2.5-7B"   "${BASE_DIR}/e1_7b"    "math500" "128")
+log "  eval 7B → job ${JID_EVAL_7B}"
 
-JID_EVAL_7B=$(submit_eval   "e1_7b"    "${JID_E1_7B}"    "Qwen/Qwen2.5-7B"    "${LORA_7B}"    "math500" "128")
-JID_EVAL_3B=$(submit_eval   "e1_3b"    "${JID_E1_3B}"    "Qwen/Qwen2.5-3B"    "${LORA_3B}"    "math500" "128")
-JID_EVAL_1P5B=$(submit_eval "e1_1p5b"  "${JID_E1_1P5B}"  "Qwen/Qwen2.5-1.5B"  "${LORA_1P5B}"  "math500" "128")
-JID_EVAL_0P5B=$(submit_eval "e1_0p5b"  "${JID_E1_0P5B}"  "Qwen/Qwen2.5-0.5B"  "${LORA_0P5B}"  "math500" "128")
+JID_EVAL_3B=$(submit_eval   "e1_3b"    "${JID_E1_3B}"    "Qwen/Qwen2.5-3B"   "${BASE_DIR}/e1_3b"    "math500" "128")
+log "  eval 3B → job ${JID_EVAL_3B}"
+
+JID_EVAL_1P5B=$(submit_eval "e1_1p5b"  "${JID_E1_1P5B}"  "Qwen/Qwen2.5-1.5B" "${BASE_DIR}/e1_1p5b"  "math500" "128")
+log "  eval 1.5B → job ${JID_EVAL_1P5B}"
+
+JID_EVAL_0P5B=$(submit_eval "e1_0p5b"  "${JID_E1_0P5B}"  "Qwen/Qwen2.5-0.5B" "${BASE_DIR}/e1_0p5b"  "math500" "128")
+log "  eval 0.5B → job ${JID_EVAL_0P5B}"
 
 # ===========================================================================
-# GRPO baseline (λ=0) — needed for E1 comparison and E5 controllability
+# GRPO baseline (λ=0) — required for E1 comparison table and E5
 # ===========================================================================
 log "=== GRPO baseline (λ=0) ==="
+
 JID_GRPO_7B=$(submit_train "grpo_baseline_7b" "Qwen/Qwen2.5-7B" "1e-5" \
     "GRPO_BASELINE=--grpo_baseline")
-JID_EVAL_GRPO_7B=$(submit_eval "grpo_baseline_7b" "${JID_GRPO_7B}" \
+log "  GRPO 7B → job ${JID_GRPO_7B}"
+
+JID_EVAL_GRPO=$(submit_eval "grpo_baseline_7b" "${JID_GRPO_7B}" \
     "Qwen/Qwen2.5-7B" "${BASE_DIR}/grpo_baseline_7b" "math500" "128")
+log "  eval GRPO 7B → job ${JID_EVAL_GRPO}"
 
 # ===========================================================================
 # E2 — Long-CoT benchmark (Qwen2.5-7B-Instruct, OpenThoughts-3)
 # ===========================================================================
 log "=== E2: Long-CoT benchmark ==="
-JID_E2=$(submit_train "e2_longcot_7b" "Qwen/Qwen2.5-7B-Instruct" "1e-5" \
-    "DATASET=openthoughts3" "BENCHMARK=math" "N_EPOCHS=8")
 
-JID_EVAL_E2_AIME=$(submit_eval "e2_aime"  "${JID_E2}" \
+JID_E2=$(submit_train "e2_longcot_7b" "Qwen/Qwen2.5-7B-Instruct" "1e-5" \
+    "DATASET=openthoughts3")
+log "  E2 7B-Instruct → job ${JID_E2}"
+
+JID_EVAL_E2=$(submit_eval "e2_aime" "${JID_E2}" \
     "Qwen/Qwen2.5-7B-Instruct" "${BASE_DIR}/e2_longcot_7b" "aime24" "64")
-# OlympiadBench eval — depends on E2 training
-JID_EVAL_E2_OLY=$(submit_eval "e2_olympiad" "${JID_E2}" \
-    "Qwen/Qwen2.5-7B-Instruct" "${BASE_DIR}/e2_longcot_7b" "math500" "64")
+log "  eval E2 AIME → job ${JID_EVAL_E2}"
 
 # ===========================================================================
-# E3 — P(n,i) saturation curves (depends on E1 7B training completing)
+# E3 — P(n,i) saturation curves (calibrate on 7B after E1 training)
 # ===========================================================================
 log "=== E3: P(n,i) saturation curves ==="
+
 JID_CALIB_E3=$(submit_calib "e3_saturation" "${JID_E1_7B}" \
-    "Qwen/Qwen2.5-7B" "${LORA_7B}" "math")
-# Water-filling on E3 calibration
+    "Qwen/Qwen2.5-7B" "${BASE_DIR}/e1_7b" "math")
+log "  calib E3 → job ${JID_CALIB_E3}"
+
 JID_WF_E3=$(submit_wf "e3_saturation" "${JID_CALIB_E3}" \
     "${BASE_DIR}/calibration/e3_saturation.json")
+log "  water-fill E3 → job ${JID_WF_E3}"
 
 # ===========================================================================
-# E4 — Allocator comparison (uses same calibration as E3, no extra training)
+# E4 — Allocator comparison (fresh out-of-sample 500-problem calibration)
 # ===========================================================================
 log "=== E4: Allocator comparison ==="
-# Re-uses the E3 calibration JSON; water_filling.py already compares all allocators.
-# Submit a second wf run explicitly labeled e4 on a fresh calib (out-of-sample 500)
+
 JID_CALIB_E4=$(submit_calib "e4_oos" "${JID_E1_7B}" \
-    "Qwen/Qwen2.5-7B" "${LORA_7B}" "math")
+    "Qwen/Qwen2.5-7B" "${BASE_DIR}/e1_7b" "math")
+log "  calib E4 → job ${JID_CALIB_E4}"
+
 JID_WF_E4=$(submit_wf "e4_oos" "${JID_CALIB_E4}" \
     "${BASE_DIR}/calibration/e4_oos.json")
+log "  water-fill E4 → job ${JID_WF_E4}"
 
 # ===========================================================================
-# E5 — Controllability check (COLD-RL vs GRPO vs DARLING prefix=None)
+# E5 — Controllability check: COLD-RL without prefix vs GRPO
 # ===========================================================================
 log "=== E5: Controllability check ==="
-# Eval COLD-RL 7B without prefix (standard prompt) — uses existing eval job output
-# Also submits paired-t-test analysis script after both evals are done
-JID_E5_NOPFX=$(sbatch --parsable \
+
+JID_E5=$(sbatch --parsable \
     --job-name="e5-nopfx" \
     --partition=preempt \
     --gres=gpu:1 \
     --cpus-per-task=8 \
     --mem=60G \
     --time=4:00:00 \
-    --output="${LOG_DIR}/e5-nopfx-%j.out" \
+    --requeue \
+    --output="${SLOG}/e5-nopfx-%j.out" \
     --dependency="afterok:${JID_E1_7B}" \
     --wrap="
-source /home/shivansg/miniconda/etc/profile.d/conda.sh
-conda activate cold-rl
-export HF_HOME=/data/user_data/shivansg/.hf_cache
-export HF_HUB_CACHE=/data/hf_cache/hub
-export HF_HUB_OFFLINE=1
+set -e
+${CONDA_INIT}
+${HF_EXPORTS}
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+mkdir -p ${BASE_DIR}/eval
 cd ${REPO_DIR}
-# Evaluate COLD-RL model with standard (no-prefix) prompts — should match GRPO pass@1
 python3 -m evaluation.passk_method_eval \
     --model Qwen/Qwen2.5-7B \
-    --lora-path ${LORA_7B} \
+    --lora-path ${BASE_DIR}/e1_7b \
     --benchmarks math500 \
     --max-k 1 \
     --experiment-id e5_cold_noprefix \
     --out ${BASE_DIR}/eval/e5_cold_noprefix.json
 ")
-log "  submitted e5-nopfx → job ${JID_E5_NOPFX} (dep: ${JID_E1_7B})"
+log "  E5 no-prefix → job ${JID_E5}"
 
 # ===========================================================================
 # Summary
 # ===========================================================================
 log ""
-log "=== Submission complete ==="
-log "Training jobs:"
-log "  E1 7B   : ${JID_E1_7B}"
-log "  E1 3B   : ${JID_E1_3B}"
-log "  E1 1.5B : ${JID_E1_1P5B}"
-log "  E1 0.5B : ${JID_E1_0P5B}"
-log "  GRPO 7B : ${JID_GRPO_7B}"
-log "  E2 7B   : ${JID_E2}"
-log ""
-log "Eval/calib/wf jobs are chained with afterok dependencies."
-log ""
+log "══════════════════════════════════════════════"
+log "Submission complete. All jobs queued."
+log "══════════════════════════════════════════════"
+log "Training:"
+log "  e1_7b          ${JID_E1_7B}"
+log "  e1_3b          ${JID_E1_3B}"
+log "  e1_1p5b        ${JID_E1_1P5B}"
+log "  e1_0p5b        ${JID_E1_0P5B}"
+log "  grpo_baseline  ${JID_GRPO_7B}"
+log "  e2_longcot     ${JID_E2}"
 log "Monitor: squeue -u \$USER"
-log "Logs   : ${LOG_DIR}/"
-log "Results: ${BASE_DIR}/"
+log "Logs:    ${SLOG}/"
