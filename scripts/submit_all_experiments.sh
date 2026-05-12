@@ -34,7 +34,7 @@ HF_EXPORTS="export HF_HOME=/data/user_data/shivansg/.hf_cache HF_DATASETS_CACHE=
 submit_setup() {
     sbatch --parsable \
         --job-name="cold-setup" \
-        --partition=general \
+        --partition=cpu \
         --cpus-per-task=8 \
         --mem=32G \
         --time=12:00:00 \
